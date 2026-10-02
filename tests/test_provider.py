@@ -359,7 +359,7 @@ def test_provider_declares_fields_webhook_and_workflows():
     assert [(c["kind"], c["slug"]) for c in content] == [
         ("entry_fields", "square-shop-fields"),
         ("incoming_webhook", "square-events"),
-        ("workflow", "square-list-on-publish"),
+        ("workflow", "square-list-for-sale"),
         ("workflow", "square-mark-sold"),
         ("workflow", "square-close-when-sold"),
     ]

@@ -5,7 +5,7 @@ workspace's own item type, the incoming webhook Square posts to, and three workf
 workflows arrive switched off; turning them on after a review is the deliberate last step.
 
 The loop:
-  publish an item with "Sell online" on → `create_listing` → ids + checkout URL stored on the entry
+  a published item with "Sell online" on (or a new price/shipping) → `create_listing` → ids + checkout URL stored on the entry
   → the site shows a Buy button. A sale — through the link, or rung up on a card reader as the
   catalog item — takes the stock to 0 → Square posts `inventory.count.updated` → the item's status
   becomes "sold" → its checkout link is closed and the site rebuilt.
@@ -79,19 +79,25 @@ EVENTS_WEBHOOK = ContentBlueprint(
 
 LIST_ON_PUBLISH = ContentBlueprint(
     kind="workflow",
-    slug="square-list-on-publish",
-    name="Square: list on publish",
-    description="When an item with Sell online is published, create (or refresh) its Square listing and store the checkout link on it.",
+    slug="square-list-for-sale",
+    name="Square: list for sale",
+    description="When a published item has Sell online on — or its price or shipping changes — create (or refresh) its Square listing and store the checkout link on it.",
     required=True,
     category=CATEGORY,
     parameters=(ENTRY_TYPE_PARAM, INTEGRATION_PARAM),
     payload={
         "definition": {
-            "trigger": {"type": "event", "event": "entry_published"},
+            # entry_updated, not entry_published: publishing is an update too, and Sell online is often
+            # switched on for a work that is already published. What it was listed at is stored below,
+            # so a listing happens once per price/shipping (its own metadata write doesn't loop).
+            "trigger": {"type": "event", "event": "entry_updated"},
             "conditions": [
                 {"field": "entry.entry_type", "op": "eq", "value": "{{entry_type}}"},
+                {"field": "entry.status", "op": "eq", "value": "published"},
                 {"field": "entry.data.sellOnline", "op": "eq", "value": True},
                 {"field": "entry.data.status", "op": "neq", "value": "sold"},
+                {"field": "entry.data.price", "op": "exists"},
+                {"field": "entry.metadata.square_listed_for", "op": "neq", "value": "${entry.data.price}|${entry.data.shippingFee}"},
             ],
             "actions": [
                 {
@@ -119,6 +125,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "square_order_id": "${steps.listing.output.order_id}",
                         "checkout_url": "${steps.listing.output.checkout_url}",
                         "checkout_provider": "square",
+                        "square_listed_for": "${entry.data.price}|${entry.data.shippingFee}",
                     },
                 },
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square listing"}},

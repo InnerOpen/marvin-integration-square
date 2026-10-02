@@ -82,7 +82,7 @@ parameters: `entry_type` (the type whose entries are for sale, default `artwork`
 |---|---|---|
 | fields | `square-shop-fields` | Adds `sellOnline` (boolean), `price` (text) and `shippingFee` (text) to the item type — fields it already has are left alone. |
 | incoming webhook | `square-events` | Square posts here. Signature scheme `square`, key in the workspace secret `SQUARE_SIGNATURE_KEY`. |
-| workflow | `square-list-on-publish` | On publish of an item with Sell online (and not sold): `create_listing` → store the ids below → rebuild the site. |
+| workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price/shipping that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below → rebuild the site. Covers first listing, switching Sell online on later, and price changes. |
 | workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → find the item by `square_variation_id` → status `sold`. Covers a sale through the link *and* a card-reader sale rung up as the catalog item. |
 | workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → `close_listing` → mark `checkout_closed` → rebuild. Runs once per item. |
 
