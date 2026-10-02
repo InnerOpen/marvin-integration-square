@@ -30,6 +30,7 @@ from marvin_integration_sdk import (
     register_provider,
 )
 
+from .content import CONTENT
 from .money import optional_fee_cents, price_cents
 
 # Latest version in Square's API changelog when this was written (2026-10), and the version the
@@ -87,9 +88,9 @@ class SquareProvider(IntegrationProvider):
     category = CATEGORY_DESTINATION
     icon = "🟩"
 
-    # The artwork entry type belongs to the site's workspace, not to Square, so nothing is
-    # declared here. The fields and metadata keys the workflows expect are documented in the README.
-    content = ()
+    # What a workspace needs (fields on its item type, the events webhook, three workflows) —
+    # declared for review and Apply on the integration's card; see content.py.
+    content = CONTENT
 
     credentials = (
         CredentialField(

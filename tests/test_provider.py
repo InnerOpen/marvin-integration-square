@@ -344,9 +344,45 @@ def test_missing_secret_and_unknown_action_raise():
         SquareProvider().run_action("nope", {}, _ctx())
 
 
-def test_provider_declares_no_content_and_is_registered():
+def test_provider_is_registered_with_its_actions():
     from marvin_integration_sdk import get_provider
 
     info = get_provider("square").info()
-    assert info["content"] == [] and info["category"] == "destination"
+    assert info["category"] == "destination"
     assert {a["key"] for a in info["actions"]} == {"list_locations", "create_listing", "close_listing"}
+
+
+def test_provider_declares_fields_webhook_and_workflows():
+    from marvin_integration_sdk import get_provider
+
+    content = get_provider("square").info()["content"]
+    assert [(c["kind"], c["slug"]) for c in content] == [
+        ("entry_fields", "square-shop-fields"),
+        ("incoming_webhook", "square-events"),
+        ("workflow", "square-list-on-publish"),
+        ("workflow", "square-mark-sold"),
+        ("workflow", "square-close-when-sold"),
+    ]
+    assert all(c["required"] for c in content)
+
+
+def test_declared_workflows_only_call_actions_the_provider_has():
+    from marvin_integration_square.content import CONTENT
+
+    actions = {a.key for a in SquareProvider.actions}
+    called = [
+        step["action"]
+        for blueprint in CONTENT
+        if blueprint.kind == "workflow"
+        for step in blueprint.payload["definition"]["actions"]
+        if step["kind"] == "integration"
+    ]
+    assert called and set(called) <= actions
+
+
+def test_mark_sold_workflow_listens_on_the_declared_webhook():
+    from marvin_integration_square.content import CONTENT, WEBHOOK_SLUG
+
+    by_slug = {b.slug: b for b in CONTENT}
+    assert by_slug["square-mark-sold"].payload["definition"]["trigger"] == {"type": "incoming_webhook", "webhook": WEBHOOK_SLUG}
+    assert "token" not in by_slug[WEBHOOK_SLUG].payload

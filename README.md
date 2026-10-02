@@ -68,17 +68,22 @@ first listing's stored response when the item is re-listed at a new price.
 Square API errors raise a `ValueError` carrying Square's `errors[]` code and detail, so Marvin
 records a failed execution with the reason.
 
-## What the site's workflows expect
+## What a workspace gets — declared, applied from the integration's card
 
-This provider declares **no workspace content**. The artwork entry type belongs to the site's
-workspace, not to Square. The workflows that call it expect these artwork fields:
+Nothing is created on install. The integration's card lists what it needs; **Apply** creates only
+what is missing (Marvin's blueprint contract), and webhooks/workflows arrive **switched off**. Two
+parameters: `entry_type` (the type whose entries are for sale, default `artwork`) and `integration`
+(this integration's slug in the workspace, default `square`). Declared in `content.py`:
 
-| Field | Type | Used for |
+| Kind | Slug | What it does |
 |---|---|---|
-| `sellOnline` | boolean | Only artworks with this set are listed on publish. |
-| `shippingFee` | text | Passed as `shipping_fee` (e.g. `"$45"`; blank = no shipping charge). |
+| fields | `square-shop-fields` | Adds `sellOnline` (boolean), `price` (text) and `shippingFee` (text) to the item type — fields it already has are left alone. |
+| incoming webhook | `square-events` | Square posts here. Signature scheme `square`, key in the workspace secret `SQUARE_SIGNATURE_KEY`. |
+| workflow | `square-list-on-publish` | On publish of an item with Sell online (and not sold): `create_listing` → store the ids below → rebuild the site. |
+| workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → find the item by `square_variation_id` → status `sold`. Covers a sale through the link *and* a card-reader sale rung up as the catalog item. |
+| workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → `close_listing` → mark `square_listing_closed` → rebuild. Runs once per item. |
 
-They store the `create_listing` output on the entry under these metadata keys:
+Metadata the workflows keep on each item:
 
 | Metadata key | From |
 |---|---|
@@ -87,19 +92,19 @@ They store the `create_listing` output on the entry under these metadata keys:
 | `square_payment_link_id` | `payment_link_id` (passed back when re-listing, and to `close_listing`) |
 | `square_order_id` | `order_id` |
 | `square_checkout_url` | `checkout_url`, the URL for the Buy button |
+| `square_listing_closed` | set once the link is closed |
 
-## Webhooks (handled by Marvin core)
+### After Apply
 
-Marking an item sold is driven by Square webhooks that **Marvin core** receives. This provider has
-no webhook handler. Webhook signature verification (`x-square-hmacsha256-signature`) also happens
-in core. The workflows use:
+1. Integration card: paste the access token; set `environment`, `location_id` (run `list_locations`) and `redirect_url`.
+2. Incoming webhook **Square events**: mint its token; in your Square app add a webhook subscription to
+   that URL for `inventory.count.updated`; store the subscription's signature key as the workspace secret
+   `SQUARE_SIGNATURE_KEY`; set the webhook's signed URL to the exact URL you gave Square; enable it.
+3. An outgoing webhook subscribed to `webhook_triggered` that calls the site's deploy hook (the
+   workflows' `request_site_rebuild` step fires it).
+4. Review the three workflows and switch them on.
 
-- **`payment.updated`** with `status` `COMPLETED`: match the payment's `order_id` against
-  `square_order_id`. This covers an online sale through the link.
-- **`inventory.count.updated`** with a quantity of `0`: match `catalog_object_id` against
-  `square_variation_id`. This covers a sale anywhere, including the card reader.
-
-Either one marks the artwork sold and calls `close_listing` with `square_payment_link_id`.
+Webhook signature verification happens in Marvin core, not here.
 
 ## Develop
 
