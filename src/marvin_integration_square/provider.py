@@ -92,6 +92,17 @@ class SquareProvider(IntegrationProvider):
     # declared for review and Apply on the integration's card; see content.py.
     content = CONTENT
 
+    # Square signs `notification URL + body` (base64 HMAC-SHA256). Contributed to Marvin's webhook
+    # signature schemes so the declared `square-events` webhook (and any other) can verify it.
+    signature_schemes: ClassVar[dict[str, dict]] = {
+        "square": {
+            "encoding": "base64",
+            "message": "{url}{body}",
+            "header": "x-square-hmacsha256-signature",
+            "notes": "Square: base64 of URL + body",
+        }
+    }
+
     credentials = (
         CredentialField(
             key="access_token",

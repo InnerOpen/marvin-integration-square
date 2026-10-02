@@ -108,7 +108,10 @@ Metadata the workflows keep on each item:
    workflows' `request_site_rebuild` step fires it).
 4. Review the three workflows and switch them on.
 
-Webhook signature verification happens in Marvin core, not here.
+Webhook signature verification happens in Marvin core. This integration contributes the
+`square` signature scheme (base64 HMAC-SHA256 over the notification URL + body, header
+`x-square-hmacsha256-signature`) through `signature_schemes`, so it appears in every incoming
+webhook's scheme picker while the integration is installed.
 
 ## Develop
 

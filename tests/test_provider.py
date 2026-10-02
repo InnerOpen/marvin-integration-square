@@ -386,3 +386,11 @@ def test_mark_sold_workflow_listens_on_the_declared_webhook():
     by_slug = {b.slug: b for b in CONTENT}
     assert by_slug["square-mark-sold"].payload["definition"]["trigger"] == {"type": "incoming_webhook", "webhook": WEBHOOK_SLUG}
     assert "token" not in by_slug[WEBHOOK_SLUG].payload
+
+
+def test_contributes_the_square_signature_scheme():
+    from marvin_integration_square.content import CONTENT, WEBHOOK_SLUG
+
+    scheme = SquareProvider.signature_schemes["square"]
+    assert scheme["message"] == "{url}{body}" and scheme["encoding"] == "base64"
+    assert {b.slug: b for b in CONTENT}[WEBHOOK_SLUG].payload["signature_scheme"] == "square"
