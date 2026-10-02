@@ -125,6 +125,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "square_order_id": "${steps.listing.output.order_id}",
                         "checkout_url": "${steps.listing.output.checkout_url}",
                         "checkout_provider": "square",
+                        "checkout_closed": False,
                         "square_listed_for": "${entry.data.price}|${entry.data.shippingFee}",
                     },
                 },
@@ -181,7 +182,8 @@ CLOSE_WHEN_SOLD = ContentBlueprint(
                 {"field": "entry.data.status", "op": "eq", "value": "sold"},
                 {"field": "entry.metadata.square_payment_link_id", "op": "exists"},
                 # The marker set below: without it, every later edit of a sold item would close and rebuild again.
-                {"field": "entry.metadata.checkout_closed", "op": "exists", "value": False},
+                # A re-listing sets it back to false, so the next sale closes the new link too.
+                {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True},
             ],
             "actions": [
                 {
@@ -190,7 +192,8 @@ CLOSE_WHEN_SOLD = ContentBlueprint(
                     "action": "close_listing",
                     "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}"},
                 },
-                {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True}},
+                # "closed" never equals a price|shipping, so setting the item back to available re-lists it.
+                {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True, "square_listed_for": "closed"}},
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square sale"}},
             ],
         }
