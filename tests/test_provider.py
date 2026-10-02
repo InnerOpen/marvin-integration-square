@@ -364,6 +364,9 @@ def test_provider_declares_fields_webhook_and_workflows():
         ("workflow", "square-list-for-sale"),
         ("workflow", "square-mark-sold"),
         ("workflow", "square-close-when-sold"),
+        ("workflow", "square-close-when-withdrawn"),
+        ("workflow", "square-close-when-unpublished"),
+        ("workflow", "square-close-when-archived"),
     ]
     assert all(c["required"] for c in content)
 
@@ -471,3 +474,33 @@ def test_list_for_sale_workflow_passes_the_entrys_picture():
     (workflow,) = [b for b in CONTENT if b.slug == "square-list-for-sale"]
     step = next(s for s in workflow.payload["definition"]["actions"] if s.get("action") == "create_listing")
     assert step["args"]["image_url"] == "${entry.image}"
+
+
+@pytest.mark.parametrize(
+    ("slug", "event"),
+    [
+        ("square-close-when-withdrawn", "entry_updated"),
+        ("square-close-when-unpublished", "entry_unpublished"),
+        ("square-close-when-archived", "entry_archived"),
+    ],
+)
+def test_taking_an_item_out_of_the_shop_closes_its_link(slug, event):
+    # A duplicate being archived, or Sell online switched off, must not leave a payable link behind.
+    from marvin_integration_square.content import CONTENT
+
+    (workflow,) = [b for b in CONTENT if b.slug == slug]
+    definition = workflow.payload["definition"]
+    assert definition["trigger"] == {"type": "event", "event": event}
+    assert [a.get("action") for a in definition["actions"] if a["kind"] == "integration"] == ["close_listing"]
+    marker = next(a for a in definition["actions"] if a.get("op") == "set_metadata")["metadata"]
+    # Same marker as close-when-sold: no repeat close, and switching back on lists it again.
+    assert marker == {"checkout_closed": True, "square_listed_for": "closed"}
+    fields = {c["field"] for c in definition["conditions"]}
+    assert {"entry.metadata.square_payment_link_id", "entry.metadata.checkout_closed"} <= fields
+
+
+def test_switching_sell_online_off_is_what_withdraws_it():
+    from marvin_integration_square.content import CLOSE_WHEN_WITHDRAWN
+
+    conditions = CLOSE_WHEN_WITHDRAWN.payload["definition"]["conditions"]
+    assert {"field": "entry.data.sellOnline", "op": "neq", "value": True} in conditions

@@ -85,6 +85,9 @@ parameters: `entry_type` (the type whose entries are for sale, default `artwork`
 | workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price/shipping that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below → rebuild the site. Covers first listing, switching Sell online on later, and price changes. |
 | workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → find the item by `square_variation_id` → status `sold`. Covers a sale through the link *and* a card-reader sale rung up as the catalog item. |
 | workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → `close_listing` → mark `checkout_closed` → rebuild. Runs once per item. |
+| workflow | `square-close-when-withdrawn` | Sell online switched off → `close_listing` → mark `checkout_closed` → rebuild. Switching it back on lists it again. |
+| workflow | `square-close-when-unpublished` | Item unpublished → `close_listing` → mark → rebuild. Republishing lists it again. |
+| workflow | `square-close-when-archived` | Item archived (e.g. a duplicate retired) → `close_listing` → mark → rebuild. |
 
 Metadata the workflows keep on each item:
 
@@ -106,7 +109,7 @@ Metadata the workflows keep on each item:
    `SQUARE_SIGNATURE_KEY`; set the webhook's signed URL to the exact URL you gave Square; enable it.
 3. An outgoing webhook subscribed to `webhook_triggered` that calls the site's deploy hook (the
    workflows' `request_site_rebuild` step fires it).
-4. Review the three workflows and switch them on.
+4. Review the six workflows and switch them on. Retire an item by archiving it (its link closes); deleting an entry can't close its link.
 
 Webhook signature verification happens in Marvin core. This integration contributes the
 `square` signature scheme (base64 HMAC-SHA256 over the notification URL + body, header
