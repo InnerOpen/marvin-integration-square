@@ -31,10 +31,10 @@ ENTRY_TYPE_PARAM = {
 }
 INTEGRATION_PARAM = {
     "key": "integration",
-    "label": "This Square integration's slug",
-    "kind": "text",
+    "label": "Which Square connection",
+    "kind": "integration",
     "default": "square",
-    "help": "Shown on the integration's card.",
+    "help": "The workflows call this connection's actions.",
 }
 
 WEBHOOK_SLUG = "square-events"
