@@ -68,18 +68,19 @@ class _StubHttp:
         self.routes = routes or []
         self.calls: list[dict] = []
 
-    def _answer(self, method, url, body=None, headers=None):
-        self.calls.append({"method": method, "url": url, "json": body, "headers": headers})
+    def _answer(self, method, url, body=None, headers=None, data=None):
+        self.calls.append({"method": method, "url": url, "json": body, "headers": headers, "data": data})
         for route_method, needle, status, payload in self.routes:
             if route_method == method and needle in url:
-                return Response(status_code=status, content=json.dumps(payload).encode())
+                content = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+                return Response(status_code=status, content=content)
         return Response(status_code=599, content=b'{"errors":[{"detail":"no stub route"}]}')
 
     def get(self, url, *, headers=None, timeout=15):
         return self._answer("GET", url, headers=headers)
 
     def post(self, url, *, json=None, data=None, headers=None, timeout=15):
-        return self._answer("POST", url, json, headers)
+        return self._answer("POST", url, json, headers, data)
 
     def put(self, url, *, json=None, data=None, headers=None, timeout=15):
         return self._answer("PUT", url, json, headers)
@@ -179,6 +180,7 @@ def test_create_listing_returns_all_ids_and_checkout_url():
         "payment_link_id": "PL1",
         "checkout_url": "https://square.link/u/abc",
         "order_id": "ORD1",
+        "image_id": None,
     }
 
 
@@ -394,3 +396,78 @@ def test_contributes_the_square_signature_scheme():
     scheme = SquareProvider.signature_schemes["square"]
     assert scheme["message"] == "{url}{body}" and scheme["encoding"] == "base64"
     assert {b.slug: b for b in CONTENT}[WEBHOOK_SLUG].payload["signature_scheme"] == "square"
+
+
+# ---- picture --------------------------------------------------------------------------------
+
+PICTURE_URL = "https://cms.example/assets/blue-hour.jpg"
+JPEG = b"\xff\xd8\xff\xe0" + b"pixels"
+IMAGE_UPLOADED = {"image": {"type": "IMAGE", "id": "IMG9", "image_data": {"url": "https://items-images.example/IMG9.jpg"}}}
+
+
+def _picture_http(picture=JPEG, picture_status=200, upload_status=200, upsert=NEW_ITEM):
+    http = _listing_http(upsert=upsert)
+    http.routes[:0] = [
+        ("GET", PICTURE_URL, picture_status, picture),
+        ("POST", "/v2/catalog/images", upload_status, IMAGE_UPLOADED if upload_status == 200 else SQUARE_400),
+    ]
+    return http
+
+
+def _upload(http):
+    return next(c for c in http.calls if "/v2/catalog/images" in c["url"])
+
+
+def test_create_listing_with_image_url_uploads_it_as_the_items_primary_image():
+    http = _picture_http()
+    out = _list(http, image_url=PICTURE_URL)
+    body = _upload(http)["data"]
+    request = json.loads(body.split(b'name="request"', 1)[1].split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0])
+    assert out["image_id"] == "IMG9"
+    assert (request["object_id"], request["is_primary"], request["image"]["id"]) == ("ITEM1", True, "#image")
+    assert b'name="file"; filename="image.jpg"\r\nContent-Type: image/jpeg\r\n\r\n' + JPEG in body
+
+
+def test_create_listing_image_upload_is_multipart_with_matching_boundary():
+    http = _picture_http()
+    _list(http, image_url=PICTURE_URL)
+    call = _upload(http)
+    boundary = call["headers"]["Content-Type"].split("boundary=", 1)[1]
+    assert call["headers"]["Content-Type"].startswith("multipart/form-data; ")
+    assert call["data"].startswith(f"--{boundary}\r\n".encode()) and call["data"].endswith(f"--{boundary}--\r\n".encode())
+
+
+def test_create_listing_keeps_an_existing_items_picture():
+    http = _picture_http(upsert=UPDATED_ITEM)
+    out = _list(http, variation_id="VAR0", image_url=PICTURE_URL)
+    assert out["image_id"] is None
+    assert not any(PICTURE_URL in c["url"] or "/v2/catalog/images" in c["url"] for c in http.calls)
+
+
+@pytest.mark.parametrize(
+    "http",
+    [
+        _picture_http(picture_status=404),
+        _picture_http(picture=b"RIFF....WEBPVP8 "),
+        _picture_http(upload_status=400),
+    ],
+    ids=["unreachable", "unsupported-type", "square-rejects"],
+)
+def test_create_listing_with_unusable_picture_still_lists(http):
+    out = _list(http, image_url=PICTURE_URL)
+    assert out["checkout_url"] == "https://square.link/u/abc" and out["image_id"] is None
+
+
+@pytest.mark.parametrize("image_url", [None, "", "  "])
+def test_create_listing_without_image_url_fetches_nothing(image_url):
+    http = _picture_http()
+    _list(http, image_url=image_url)
+    assert not any("/v2/catalog/images" in c["url"] for c in http.calls)
+
+
+def test_list_for_sale_workflow_passes_the_entrys_picture():
+    from marvin_integration_square.content import CONTENT
+
+    (workflow,) = [b for b in CONTENT if b.slug == "square-list-for-sale"]
+    step = next(s for s in workflow.payload["definition"]["actions"] if s.get("action") == "create_listing")
+    assert step["args"]["image_url"] == "${entry.image}"

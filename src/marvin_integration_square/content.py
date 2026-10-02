@@ -113,6 +113,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "description": "${entry.summary}",
                         "variation_id": "${entry.metadata.square_variation_id}",
                         "payment_link_id": "${entry.metadata.square_payment_link_id}",
+                        "image_url": "${entry.image}",
                     },
                 },
                 {

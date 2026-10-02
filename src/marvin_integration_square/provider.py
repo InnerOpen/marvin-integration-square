@@ -15,6 +15,7 @@ is the core's job.
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import ClassVar
@@ -50,6 +51,10 @@ SHIPPING_FEE_NAME = "Shipping"
 SLUG_PLACEHOLDER = "{slug}"
 HTTP_NOT_FOUND = 404
 ERROR_TEXT_LIMIT = 300
+# CreateCatalogImage accepts JPEG, PJPEG, PNG and GIF up to 15 MB. Typed by magic bytes, not the
+# download's Content-Type, which storage servers often get wrong.
+IMAGE_MAX_BYTES = 15 * 1024 * 1024
+IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg", "jpg"), (b"\x89PNG\r\n\x1a\n", "image/png", "png"), (b"GIF8", "image/gif", "gif"))
 
 _ID = {"type": "string"}
 _AMOUNT = {"type": ["number", "string"], "description": "Dollars: a number (1170) or text ('$1,170')."}
@@ -174,13 +179,18 @@ class SquareProvider(IntegrationProvider):
                     "description": {"type": "string"},
                     "variation_id": {**_ID, "description": "Existing variation from an earlier listing of the same item."},
                     "payment_link_id": {**_ID, "description": "Existing payment link to replace."},
+                    "image_url": {
+                        **_ID,
+                        "description": "Public URL of the item's picture (JPEG, PNG or GIF). Uploaded to the catalog item so the checkout shows it; "
+                        "skipped when the item already has a picture. A picture that can't be fetched never stops the listing.",
+                    },
                 },
                 "required": ["slug", "name", "price"],
                 "additionalProperties": False,
             },
             output_schema={
                 "type": "object",
-                "properties": {"item_id": _ID, "variation_id": _ID, "payment_link_id": _ID, "checkout_url": _ID, "order_id": _ID},
+                "properties": {"item_id": _ID, "variation_id": _ID, "payment_link_id": _ID, "checkout_url": _ID, "order_id": _ID, "image_id": _ID},
             },
         ),
         ProviderAction(
@@ -234,6 +244,18 @@ class SquareProvider(IntegrationProvider):
     def _post(self, ctx: IntegrationContext, path: str, body: dict, what: str) -> dict:
         resp = ctx.http.post(f"{self._base(ctx)}{path}", json=body, headers=self._headers(ctx))
         return self._ok_json(resp, what)
+
+    def _post_multipart(self, ctx: IntegrationContext, path: str, parts: list[tuple[str, str, str | None, bytes]], what: str) -> dict:
+        """POST multipart/form-data. Each part is (name, content type, filename or None, bytes)."""
+        boundary = uuid.uuid4().hex
+        body = bytearray()
+        for name, content_type, filename, data in parts:
+            disposition = f'form-data; name="{name}"' + (f'; filename="{filename}"' if filename else "")
+            body += f"--{boundary}\r\nContent-Disposition: {disposition}\r\nContent-Type: {content_type}\r\n\r\n".encode()
+            body += data + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        headers = {**self._headers(ctx), "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        return self._ok_json(ctx.http.post(f"{self._base(ctx)}{path}", data=bytes(body), headers=headers), what)
 
     def _delete(self, ctx: IntegrationContext, path: str) -> Response:
         return ctx.http.delete(f"{self._base(ctx)}{path}", headers=self._headers(ctx))
@@ -330,6 +352,45 @@ class SquareProvider(IntegrationProvider):
         }
         self._post(ctx, "/v2/inventory/changes/batch-create", {"idempotency_key": _new_key(), "changes": [change]}, "inventory count")
 
+    @staticmethod
+    def _download_image(ctx: IntegrationContext, image_url: str) -> tuple[bytes, str, str]:
+        """The picture's bytes, MIME type and file extension. Raises ValueError when it can't be used."""
+        resp = ctx.http.get(image_url)
+        if not resp.ok:
+            raise ValueError(f"HTTP {resp.status_code} fetching {image_url}")
+        if len(resp.content) > IMAGE_MAX_BYTES:
+            raise ValueError(f"{image_url} is larger than Square's 15 MB limit")
+        kind = next(((mime, ext) for magic, mime, ext in IMAGE_SIGNATURES if resp.content.startswith(magic)), None)
+        if kind is None:
+            raise ValueError(f"{image_url} is not a JPEG, PNG or GIF")
+        return resp.content, *kind
+
+    def _attach_image(self, ctx: IntegrationContext, item_id: str, image_url: str, name: str) -> str:
+        """Upload the picture and make it the item's primary image, which the checkout page shows."""
+        data, mime, ext = self._download_image(ctx, image_url)
+        request = {
+            "idempotency_key": _new_key(),
+            "object_id": item_id,
+            "is_primary": True,
+            "image": {"type": "IMAGE", "id": "#image", "image_data": {"name": name, "caption": name}},
+        }
+        parts = [("request", "application/json", None, json.dumps(request).encode()), ("file", mime, f"image.{ext}", data)]
+        image_id = (self._post_multipart(ctx, "/v2/catalog/images", parts, "upload catalog image").get("image") or {}).get("id")
+        if not image_id:
+            raise ValueError("Square returned no image id.")
+        return image_id
+
+    def _maybe_attach_image(self, ctx: IntegrationContext, item: dict | None, item_id: str, image_url: str, name: str) -> str | None:
+        """Best effort: a missing picture must never cost the sale, so failures are logged, not raised.
+        An item that already has a picture (an earlier listing, or one set in the dashboard) keeps it."""
+        if not image_url or ((item or {}).get("item_data") or {}).get("image_ids"):
+            return None
+        try:
+            return self._attach_image(ctx, item_id, image_url, name)
+        except Exception as e:  # noqa: BLE001 — see docstring
+            ctx.logger.warning("square: listed %s without a picture: %s", item_id, e)
+            return None
+
     def _delete_link(self, ctx: IntegrationContext, payment_link_id: str) -> bool:
         """Delete a payment link. True if it was deleted, False if it was already gone."""
         resp = self._delete(ctx, f"/v2/online-checkout/payment-links/{quote(payment_link_id, safe='')}")
@@ -404,6 +465,7 @@ class SquareProvider(IntegrationProvider):
         description = str(args.get("description") or "").strip()
         old_variation_id = str(args.get("variation_id") or "").strip()
         old_link_id = str(args.get("payment_link_id") or "").strip()
+        image_url = str(args.get("image_url") or "").strip()
         location_id = self._location_id(ctx)
 
         existing = self._fetch_item_for_variation(ctx, old_variation_id) if old_variation_id else None
@@ -414,6 +476,7 @@ class SquareProvider(IntegrationProvider):
         else:
             obj, keep_variation = self._new_item(name, description, money), None
         item_id, variation_id = self._upsert_item(ctx, obj, keep_variation)
+        image_id = self._maybe_attach_image(ctx, existing, item_id, image_url, name)
 
         self._set_stock_to_one(ctx, variation_id, location_id)
         if old_link_id:
@@ -425,6 +488,7 @@ class SquareProvider(IntegrationProvider):
             "payment_link_id": link["id"],
             "checkout_url": link["url"],
             "order_id": link.get("order_id"),
+            "image_id": image_id,
         }
 
     def _action_close_listing(self, args: dict, ctx: IntegrationContext) -> dict:
