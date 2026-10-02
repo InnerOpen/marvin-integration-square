@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: MarvinIntegrationSquare
+      - name: Check out the SDK next to this repo (resolved via [tool.uv.sources])
+        uses: actions/checkout@v4
+        with:
+          repository: InnerOpen/marvin-integration-sdk
+          ref: develop
+          path: MarvinIntegrationSDK
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Test
+        working-directory: MarvinIntegrationSquare
+        run: uv run --extra dev pytest -q
+      - name: Lint
+        working-directory: MarvinIntegrationSquare
+        run: uv run --extra dev ruff check .

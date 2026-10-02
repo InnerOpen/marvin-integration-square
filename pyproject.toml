@@ -1,0 +1,31 @@
+[project]
+name = "marvin-integration-square"
+version = "0.1.0"
+description = "Square integration for Marvin — list one-of-a-kind items in the Square catalog and sell them through a checkout link."
+readme = "README.md"
+requires-python = ">=3.11"
+# 0.3 is the first SDK whose HttpHelper has delete(), which closing a payment link needs.
+dependencies = ["marvin-integration-sdk>=0.3,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+# This is the seam that makes the plugin discoverable: an installed Marvin scans this group at
+# startup and registers whatever providers it finds. No core or frontend changes needed.
+[project.entry-points."marvin.integrations"]
+square = "marvin_integration_square:SquareProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/marvin_integration_square"]
+
+# Dev only: resolve the SDK from the sibling checkout. Released builds take it from the index.
+[tool.uv.sources]
+marvin-integration-sdk = { path = "../MarvinIntegrationSDK", editable = true }
+
+[tool.ruff]
+line-length = 150
+target-version = "py311"
