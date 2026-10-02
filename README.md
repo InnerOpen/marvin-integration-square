@@ -70,6 +70,9 @@ records a failed execution with the reason.
 
 ## What a workspace gets — declared, applied from the integration's card
 
+Sites never depend on Square: the Buy button reads the provider-neutral `checkout_url` /
+`checkout_closed` metadata, which any commerce integration's workflows can write.
+
 Nothing is created on install. The integration's card lists what it needs; **Apply** creates only
 what is missing (Marvin's blueprint contract), and webhooks/workflows arrive **switched off**. Two
 parameters: `entry_type` (the type whose entries are for sale, default `artwork`) and `integration`
@@ -81,7 +84,7 @@ parameters: `entry_type` (the type whose entries are for sale, default `artwork`
 | incoming webhook | `square-events` | Square posts here. Signature scheme `square`, key in the workspace secret `SQUARE_SIGNATURE_KEY`. |
 | workflow | `square-list-on-publish` | On publish of an item with Sell online (and not sold): `create_listing` → store the ids below → rebuild the site. |
 | workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → find the item by `square_variation_id` → status `sold`. Covers a sale through the link *and* a card-reader sale rung up as the catalog item. |
-| workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → `close_listing` → mark `square_listing_closed` → rebuild. Runs once per item. |
+| workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → `close_listing` → mark `checkout_closed` → rebuild. Runs once per item. |
 
 Metadata the workflows keep on each item:
 
@@ -91,8 +94,9 @@ Metadata the workflows keep on each item:
 | `square_variation_id` | `variation_id` (passed back as `variation_id` when re-listing) |
 | `square_payment_link_id` | `payment_link_id` (passed back when re-listing, and to `close_listing`) |
 | `square_order_id` | `order_id` |
-| `square_checkout_url` | `checkout_url`, the URL for the Buy button |
-| `square_listing_closed` | set once the link is closed |
+| `checkout_url` | `checkout_url` — the Buy button's link (provider-neutral key a site reads) |
+| `checkout_provider` | `square` |
+| `checkout_closed` | set once the link is closed (provider-neutral) |
 
 ### After Apply
 

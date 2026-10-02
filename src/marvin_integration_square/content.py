@@ -10,6 +10,10 @@ The loop:
   catalog item — takes the stock to 0 → Square posts `inventory.count.updated` → the item's status
   becomes "sold" → its checkout link is closed and the site rebuilt.
 
+Sites stay provider-neutral: the workflows store the Buy-button link as `checkout_url` (with
+`checkout_provider: square`) and mark `checkout_closed` once sold — keys any commerce integration can
+write. Square's own ids stay under `square_*`.
+
 Two parameters keep it general: `entry_type` (which type is the shop's items, default `artwork`) and
 `integration` (this integration's slug in the workspace, default `square`).
 """
@@ -113,7 +117,8 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "square_variation_id": "${steps.listing.output.variation_id}",
                         "square_payment_link_id": "${steps.listing.output.payment_link_id}",
                         "square_order_id": "${steps.listing.output.order_id}",
-                        "square_checkout_url": "${steps.listing.output.checkout_url}",
+                        "checkout_url": "${steps.listing.output.checkout_url}",
+                        "checkout_provider": "square",
                     },
                 },
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square listing"}},
@@ -169,7 +174,7 @@ CLOSE_WHEN_SOLD = ContentBlueprint(
                 {"field": "entry.data.status", "op": "eq", "value": "sold"},
                 {"field": "entry.metadata.square_payment_link_id", "op": "exists"},
                 # The marker set below: without it, every later edit of a sold item would close and rebuild again.
-                {"field": "entry.metadata.square_listing_closed", "op": "exists", "value": False},
+                {"field": "entry.metadata.checkout_closed", "op": "exists", "value": False},
             ],
             "actions": [
                 {
@@ -178,7 +183,7 @@ CLOSE_WHEN_SOLD = ContentBlueprint(
                     "action": "close_listing",
                     "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}"},
                 },
-                {"kind": "entry", "op": "set_metadata", "metadata": {"square_listing_closed": True}},
+                {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True}},
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square sale"}},
             ],
         }
