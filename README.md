@@ -65,8 +65,28 @@ link that is already gone returns `already: true`. Anything else that fails rais
 Every write uses a fresh idempotency key. A key derived from the slug would make Square replay the
 first listing's stored response when the item is re-listed at a new price.
 
-Square API errors raise a `ValueError` carrying Square's `errors[]` code and detail, so Marvin
-records a failed execution with the reason.
+### Errors
+
+Every failure raises a `SquareError`. It is a `ValueError`, so Marvin fails the workflow step and
+records the run with the message. The message says what was being done and names the item, and the
+field when Square says which one, e.g. `Square couldn't save catalog item "Blue Hour" (HTTP 400):
+INVALID_VALUE: Invalid currency 'XYZ'. (field price_money)`. Each error also carries a stable `code`.
+Marvin copies it to the failed step as `${error.code}`:
+
+| `code` | When | What to do |
+|---|---|---|
+| `auth` | `AUTHENTICATION_ERROR`, HTTP 401/403: the token is wrong, expired or revoked, lacks a permission, or belongs to the other environment | Fix the connection's token or environment |
+| `invalid` | `INVALID_REQUEST_ERROR`, HTTP 400/422, or a price/shipping fee that isn't an amount, or a missing slug/name/price | Fix the item (price, currency, text) |
+| `not_found` | Square's `NOT_FOUND`: an object the item points at is gone | Look at the item's stored `square_*` ids |
+| `rate_limited` | `RATE_LIMITED`, HTTP 429 | Try again in a few minutes |
+| `unavailable` | `API_ERROR`, HTTP 5xx, or Square couldn't be reached (timeout, refused connection) | Try again later |
+| `conflict` | `VERSION_MISMATCH` (the item was edited in Square meanwhile), `IDEMPOTENCY_KEY_REUSED`, HTTP 409 | Try again; it re-reads the item first |
+| `config` | No access token, no `location_id`, or an unknown `environment`, caught before any call | Finish configuring the connection |
+| `unknown` | Anything else, e.g. a response missing the ids Square should return | Read the message |
+
+Square's specific code decides first (`NOT_FOUND` and `VERSION_MISMATCH` are filed under
+`INVALID_REQUEST_ERROR`), then its category, then the HTTP status. A 404 when re-listing a vanished
+variation, or when closing a link that is already gone, is not an error (see above).
 
 ## What a workspace gets — declared, applied from the integration's card
 

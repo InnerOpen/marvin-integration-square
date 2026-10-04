@@ -7,7 +7,19 @@ import pytest
 from marvin_integration_sdk import IntegrationContext, Response
 
 from marvin_integration_square import SquareProvider
-from marvin_integration_square.provider import SQUARE_VERSION
+from marvin_integration_square.provider import (
+    CODE_AUTH,
+    CODE_CONFIG,
+    CODE_CONFLICT,
+    CODE_INVALID,
+    CODE_NOT_FOUND,
+    CODE_RATE_LIMITED,
+    CODE_UNAVAILABLE,
+    CODE_UNKNOWN,
+    CODES,
+    SQUARE_VERSION,
+    SquareError,
+)
 
 _LOG = logging.getLogger("test")
 SANDBOX = "https://connect.squareupsandbox.com"
@@ -259,8 +271,9 @@ def test_create_listing_with_bad_input_raises_before_any_call(args):
     assert http.calls == []
 
 
-def test_api_error_raises_value_error_with_square_detail():
-    with pytest.raises(ValueError, match=r"HTTP 400: INVALID_VALUE: Invalid currency 'XYZ'\. \(field price_money\)"):
+def test_api_error_raises_value_error_naming_the_item_and_field():
+    expected = r"Square couldn't save catalog item \"Blue Hour\" \(HTTP 400\): INVALID_VALUE: Invalid currency 'XYZ'\. \(field price_money\)"
+    with pytest.raises(ValueError, match=expected):
         _list(_listing_http(upsert_status=400))
 
 
@@ -504,3 +517,155 @@ def test_switching_sell_online_off_is_what_withdraws_it():
 
     conditions = CLOSE_WHEN_WITHDRAWN.payload["definition"]["conditions"]
     assert {"field": "entry.data.sellOnline", "op": "neq", "value": True} in conditions
+
+
+# ---- failures carry a stable code -----------------------------------------------------------
+
+
+def _square_error(category, code, detail="Refused.", field=None):
+    error = {"category": category, "code": code, "detail": detail}
+    return {"errors": [{**error, "field": field} if field else error]}
+
+
+def _failing(method, needle, status, body):
+    """The listing stubs, with one call answering `status` / `body` instead."""
+    http = _listing_http()
+    http.routes.insert(0, (method, needle, status, body))
+    return http
+
+
+def _list_fails_with(http, **args) -> SquareError:
+    with pytest.raises(SquareError) as raised:
+        _list(http, **args)
+    return raised.value
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "code"),
+    [
+        (401, _square_error("AUTHENTICATION_ERROR", "UNAUTHORIZED"), CODE_AUTH),
+        (401, _square_error("AUTHENTICATION_ERROR", "ACCESS_TOKEN_EXPIRED"), CODE_AUTH),
+        (403, _square_error("AUTHENTICATION_ERROR", "INSUFFICIENT_SCOPES"), CODE_AUTH),
+        (403, {"errors": []}, CODE_AUTH),
+        (400, _square_error("INVALID_REQUEST_ERROR", "INVALID_VALUE", field="price_money"), CODE_INVALID),
+        (400, _square_error("INVALID_REQUEST_ERROR", "MISSING_REQUIRED_PARAMETER", field="object.item_data.name"), CODE_INVALID),
+        (400, _square_error("INVALID_REQUEST_ERROR", "SOMETHING_NEW"), CODE_INVALID),
+        (422, b"", CODE_INVALID),
+        (404, _square_error("INVALID_REQUEST_ERROR", "NOT_FOUND"), CODE_NOT_FOUND),
+        (429, _square_error("RATE_LIMIT_ERROR", "RATE_LIMITED"), CODE_RATE_LIMITED),
+        (429, b"", CODE_RATE_LIMITED),
+        (500, _square_error("API_ERROR", "INTERNAL_SERVER_ERROR"), CODE_UNAVAILABLE),
+        (503, _square_error("API_ERROR", "SERVICE_UNAVAILABLE"), CODE_UNAVAILABLE),
+        (502, b"<html>Bad Gateway</html>", CODE_UNAVAILABLE),
+        (400, _square_error("INVALID_REQUEST_ERROR", "VERSION_MISMATCH"), CODE_CONFLICT),
+        (400, _square_error("INVALID_REQUEST_ERROR", "IDEMPOTENCY_KEY_REUSED"), CODE_CONFLICT),
+        (409, b"", CODE_CONFLICT),
+        (402, _square_error("PAYMENT_METHOD_ERROR", "CARD_DECLINED"), CODE_UNKNOWN),
+    ],
+)
+def test_square_http_failure_maps_to_its_stable_code(status, body, code):
+    error = _list_fails_with(_failing("POST", "/v2/catalog/object", status, body))
+    assert (error.code, f"(HTTP {status})" in str(error)) == (code, True)
+
+
+def test_error_codes_are_the_documented_stable_strings():
+    assert CODES == ("auth", "invalid", "not_found", "rate_limited", "unavailable", "conflict", "config", "unknown")
+
+
+def test_square_error_is_still_a_value_error_for_the_engine():
+    assert issubclass(SquareError, ValueError)
+
+
+def test_auth_failure_says_to_check_the_token_and_environment():
+    error = _list_fails_with(_failing("POST", "/v2/catalog/object", 401, _square_error("AUTHENTICATION_ERROR", "UNAUTHORIZED")))
+    assert "Check the Square access token" in str(error)
+
+
+def test_stock_failure_names_the_item_and_field():
+    http = _failing("POST", "/v2/inventory/changes/batch-create", 400, _square_error("INVALID_REQUEST_ERROR", "INVALID_VALUE", field="quantity"))
+    error = _list_fails_with(http)
+    assert error.code == CODE_INVALID
+    assert str(error).startswith('Square couldn\'t set the stock of "Blue Hour" to 1')
+    assert str(error).endswith("INVALID_VALUE: Refused. (field quantity)")
+
+
+def test_payment_link_failure_names_the_item():
+    error = _list_fails_with(_failing("POST", "/v2/online-checkout/payment-links", 500, _square_error("API_ERROR", "INTERNAL_SERVER_ERROR")))
+    assert (error.code, str(error).startswith('Square couldn\'t create the checkout link for "Blue Hour"')) == (CODE_UNAVAILABLE, True)
+
+
+def test_replacing_the_old_link_failing_names_the_link():
+    error = _list_fails_with(_failing("DELETE", "/v2/online-checkout/payment-links/", 409, b""), payment_link_id="OLD")
+    assert (error.code, "delete payment link OLD" in str(error)) == (CODE_CONFLICT, True)
+
+
+def test_unexpected_square_response_is_unknown():
+    error = _list_fails_with(_failing("POST", "/v2/catalog/object", 200, {"catalog_object": {}}))
+    assert (error.code, "returned no item/variation id" in str(error)) == (CODE_UNKNOWN, True)
+
+
+@pytest.mark.parametrize(("price", "fee"), [("abc", None), (0, None), ("$1,170", "lots")])
+def test_unusable_price_or_shipping_is_invalid_and_names_the_item(price, fee):
+    http = _listing_http()
+    error = _list_fails_with(http, price=price, shipping_fee=fee)
+    assert (error.code, str(error).startswith('"Blue Hour" can\'t be listed'), http.calls) == (CODE_INVALID, True, [])
+
+
+def test_missing_price_is_invalid():
+    with pytest.raises(SquareError, match="has no price") as raised:
+        SquareProvider().run_action("create_listing", {"slug": "a", "name": "A"}, _ctx())
+    assert raised.value.code == CODE_INVALID
+
+
+@pytest.mark.parametrize(
+    ("ctx_kwargs", "match"),
+    [({"secret": None}, "access token"), ({"location_id": ""}, "location_id"), ({"environment": "staging"}, "environment")],
+)
+def test_connection_missing_something_is_config(ctx_kwargs, match):
+    with pytest.raises(SquareError, match=match) as raised:
+        SquareProvider().run_action("create_listing", {"slug": "a", "name": "A", "price": 5}, _ctx(**ctx_kwargs))
+    assert raised.value.code == CODE_CONFIG
+
+
+class _Unreachable(_StubHttp):
+    def post(self, url, **kwargs):
+        raise TimeoutError("timed out")
+
+
+def test_a_network_error_fails_the_step_as_unavailable():
+    error = _list_fails_with(_Unreachable(_listing_http().routes))
+    assert (error.code, "couldn't reach Square (TimeoutError: timed out)" in str(error)) == (CODE_UNAVAILABLE, True)
+
+
+class _Broken(_StubHttp):
+    def post(self, url, **kwargs):
+        raise RuntimeError("boom")
+
+
+def test_any_other_exception_fails_the_step_as_a_coded_value_error():
+    error = _list_fails_with(_Broken(_listing_http().routes))
+    assert (error.code, "Square create_listing failed: RuntimeError: boom" in str(error)) == (CODE_UNKNOWN, True)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "code"),
+    [(500, b"", CODE_UNAVAILABLE), (401, _square_error("AUTHENTICATION_ERROR", "ACCESS_TOKEN_REVOKED"), CODE_AUTH)],
+)
+def test_close_listing_failure_is_coded_and_names_the_link(status, body, code):
+    http = _StubHttp([("DELETE", "/v2/online-checkout/payment-links/", status, body)])
+    with pytest.raises(SquareError, match="delete payment link PL1") as raised:
+        SquareProvider().run_action("close_listing", {"payment_link_id": "PL1"}, _ctx(http))
+    assert raised.value.code == code
+
+
+def test_close_listing_without_id_is_invalid():
+    with pytest.raises(SquareError) as raised:
+        SquareProvider().run_action("close_listing", {}, _ctx())
+    assert raised.value.code == CODE_INVALID
+
+
+def test_list_locations_failure_is_coded():
+    http = _StubHttp([("GET", "/v2/locations", 429, _square_error("RATE_LIMIT_ERROR", "RATE_LIMITED"))])
+    with pytest.raises(SquareError, match="list locations") as raised:
+        SquareProvider().run_action("list_locations", {}, _ctx(http))
+    assert raised.value.code == CODE_RATE_LIMITED

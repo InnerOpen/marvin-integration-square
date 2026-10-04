@@ -50,7 +50,57 @@ VARIATION_NAME = "Original"
 SHIPPING_FEE_NAME = "Shipping"
 SLUG_PLACEHOLDER = "{slug}"
 HTTP_NOT_FOUND = 404
+HTTP_SERVER_ERROR = 500
 ERROR_TEXT_LIMIT = 300
+
+# The stable codes a failure carries (SquareError.code) — Square's error categories and codes folded
+# to what someone does about them.
+CODE_AUTH = "auth"  # the token is bad, expired, revoked, or lacks a permission: fix the connection
+CODE_INVALID = "invalid"  # Square refused the request (a bad price, currency or missing field): fix the item
+CODE_NOT_FOUND = "not_found"  # a Square object the item points at is gone
+CODE_RATE_LIMITED = "rate_limited"  # too many calls: try again later
+CODE_UNAVAILABLE = "unavailable"  # Square's side failed, or it couldn't be reached: try again later
+CODE_CONFLICT = "conflict"  # the object changed in Square meanwhile, or an idempotency key clashed
+CODE_CONFIG = "config"  # the connection is missing something before any call (token, location, environment)
+CODE_UNKNOWN = "unknown"  # anything else, e.g. a response without the ids Square should return
+CODES = (CODE_AUTH, CODE_INVALID, CODE_NOT_FOUND, CODE_RATE_LIMITED, CODE_UNAVAILABLE, CODE_CONFLICT, CODE_CONFIG, CODE_UNKNOWN)
+CODE_BY_SQUARE_CODE = {
+    "UNAUTHORIZED": CODE_AUTH,
+    "ACCESS_TOKEN_EXPIRED": CODE_AUTH,
+    "ACCESS_TOKEN_REVOKED": CODE_AUTH,
+    "CLIENT_DISABLED": CODE_AUTH,
+    "FORBIDDEN": CODE_AUTH,
+    "INSUFFICIENT_SCOPES": CODE_AUTH,
+    "NOT_FOUND": CODE_NOT_FOUND,
+    "RATE_LIMITED": CODE_RATE_LIMITED,
+    "VERSION_MISMATCH": CODE_CONFLICT,
+    "IDEMPOTENCY_KEY_REUSED": CODE_CONFLICT,
+    "CONFLICT": CODE_CONFLICT,
+    "INTERNAL_SERVER_ERROR": CODE_UNAVAILABLE,
+    "BAD_GATEWAY": CODE_UNAVAILABLE,
+    "SERVICE_UNAVAILABLE": CODE_UNAVAILABLE,
+    "GATEWAY_TIMEOUT": CODE_UNAVAILABLE,
+}
+CODE_BY_CATEGORY = {
+    "AUTHENTICATION_ERROR": CODE_AUTH,
+    "INVALID_REQUEST_ERROR": CODE_INVALID,
+    "RATE_LIMIT_ERROR": CODE_RATE_LIMITED,
+    "API_ERROR": CODE_UNAVAILABLE,
+}
+CODE_BY_STATUS = {
+    400: CODE_INVALID,
+    401: CODE_AUTH,
+    403: CODE_AUTH,
+    404: CODE_NOT_FOUND,
+    409: CODE_CONFLICT,
+    422: CODE_INVALID,
+    429: CODE_RATE_LIMITED,
+}
+HINTS = {
+    CODE_AUTH: "Check the Square access token, and that the connection's environment matches it.",
+    CODE_RATE_LIMITED: "Square is limiting requests; try again in a few minutes.",
+    CODE_UNAVAILABLE: "Square had a problem on its side; try again later.",
+}
 # CreateCatalogImage accepts JPEG, PJPEG, PNG and GIF up to 15 MB. Typed by magic bytes, not the
 # download's Content-Type, which storage servers often get wrong.
 IMAGE_MAX_BYTES = 15 * 1024 * 1024
@@ -71,18 +121,45 @@ def _now_rfc3339() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _square_errors(resp: Response) -> str:
-    """Square's `errors[]` as one readable line, falling back to the raw body."""
+class SquareError(ValueError):
+    """A readable failure with a stable ``code`` (one of ``CODES``).
+
+    Still a ValueError, so Marvin fails the workflow step with the message; a Marvin that reads the
+    ``code`` hands it on as ``${error.code}``."""
+
+    def __init__(self, message: str, code: str = CODE_UNKNOWN) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _square_errors(resp: Response) -> list[dict]:
     try:
-        errors = (resp.json() or {}).get("errors") or []
+        body = resp.json()
     except ValueError:
-        errors = []
-    return "; ".join(_describe_error(e) for e in errors if isinstance(e, dict)) or resp.text[:ERROR_TEXT_LIMIT]
+        return []
+    errors = body.get("errors") if isinstance(body, dict) else None
+    return [e for e in errors if isinstance(e, dict)] if isinstance(errors, list) else []
+
+
+def _code_for(status: int, errors: list[dict]) -> str:
+    """Square's own code first (NOT_FOUND and VERSION_MISMATCH sit under INVALID_REQUEST_ERROR), then
+    its category, then the HTTP status."""
+    first = errors[0] if errors else {}
+    by_status = CODE_UNAVAILABLE if status >= HTTP_SERVER_ERROR else CODE_BY_STATUS.get(status, CODE_UNKNOWN)
+    return CODE_BY_SQUARE_CODE.get(first.get("code")) or CODE_BY_CATEGORY.get(first.get("category")) or by_status
 
 
 def _describe_error(error: dict) -> str:
     text = ": ".join(str(error[k]) for k in ("code", "detail") if error.get(k)) or "unknown error"
     return f"{text} (field {error['field']})" if error.get("field") else text
+
+
+def _http_error(resp: Response, what: str) -> SquareError:
+    errors = _square_errors(resp)
+    code = _code_for(resp.status_code, errors)
+    detail = "; ".join(_describe_error(e) for e in errors) or resp.text[:ERROR_TEXT_LIMIT]
+    hint = f" {HINTS[code]}" if code in HINTS else ""
+    return SquareError(f"Square couldn't {what} (HTTP {resp.status_code}): {detail}{hint}", code)
 
 
 @register_provider
@@ -216,7 +293,7 @@ class SquareProvider(IntegrationProvider):
     def _base(self, ctx: IntegrationContext) -> str:
         env = (self._cfg(ctx).get("environment") or DEFAULT_ENVIRONMENT).strip().lower()
         if env not in BASE_URLS:
-            raise ValueError(f"Unknown Square environment {env!r}; use 'sandbox' or 'production'.")
+            raise SquareError(f"Unknown Square environment {env!r}; use 'sandbox' or 'production'.", CODE_CONFIG)
         return BASE_URLS[env]
 
     @staticmethod
@@ -226,7 +303,7 @@ class SquareProvider(IntegrationProvider):
     def _location_id(self, ctx: IntegrationContext) -> str:
         location_id = (self._cfg(ctx).get("location_id") or "").strip()
         if not location_id:
-            raise ValueError("No Square location_id configured; run list_locations and add one to the integration config.")
+            raise SquareError("No Square location_id configured; run list_locations and add one to the integration config.", CODE_CONFIG)
         return location_id
 
     def _currency(self, ctx: IntegrationContext) -> str:
@@ -235,7 +312,7 @@ class SquareProvider(IntegrationProvider):
     @staticmethod
     def _ok_json(resp: Response, what: str) -> dict:
         if not resp.ok:
-            raise ValueError(f"Square {what} failed: HTTP {resp.status_code}: {_square_errors(resp)}")
+            raise _http_error(resp, what)
         return resp.json() if resp.content else {}
 
     def _get(self, ctx: IntegrationContext, path: str) -> Response:
@@ -272,13 +349,13 @@ class SquareProvider(IntegrationProvider):
         resp = self._get(ctx, f"/v2/catalog/object/{quote(variation_id, safe='')}?include_related_objects=true")
         if resp.status_code == HTTP_NOT_FOUND:
             return None
-        data = self._ok_json(resp, "retrieve catalog variation")
+        data = self._ok_json(resp, f"look up variation {variation_id} from the earlier listing")
         item_id = ((data.get("object") or {}).get("item_variation_data") or {}).get("item_id")
         item = next((o for o in data.get("related_objects") or [] if o.get("type") == "ITEM" and o.get("id") == item_id), None)
         if item is None and item_id:
-            item = self._ok_json(self._get(ctx, f"/v2/catalog/object/{quote(item_id, safe='')}"), "retrieve catalog item").get("object")
+            item = self._ok_json(self._get(ctx, f"/v2/catalog/object/{quote(item_id, safe='')}"), f"look up catalog item {item_id}").get("object")
         if not item:
-            raise ValueError(f"Square variation {variation_id} has no parent item.")
+            raise SquareError(f"Square variation {variation_id} has no parent item.")
         return item
 
     @staticmethod
@@ -321,13 +398,14 @@ class SquareProvider(IntegrationProvider):
             item_data["description"] = description
         variation = next((v for v in item_data.get("variations") or [] if v.get("id") == variation_id), None)
         if variation is None:
-            raise ValueError(f"Square item {item.get('id')} does not contain variation {variation_id}.")
+            raise SquareError(f"Square item {item.get('id')} does not contain variation {variation_id}.")
         vdata = variation.setdefault("item_variation_data", {})
         vdata.update({"pricing_type": "FIXED_PRICING", "price_money": money, "track_inventory": True})
         return item
 
     def _upsert_item(self, ctx: IntegrationContext, obj: dict, variation_id: str | None) -> tuple[str, str]:
-        data = self._post(ctx, "/v2/catalog/object", {"idempotency_key": _new_key(), "object": obj}, "catalog upsert")
+        what = f'save catalog item "{(obj.get("item_data") or {}).get("name")}"'
+        data = self._post(ctx, "/v2/catalog/object", {"idempotency_key": _new_key(), "object": obj}, what)
         saved = data.get("catalog_object") or {}
         variations = (saved.get("item_data") or {}).get("variations") or []
         if variation_id:
@@ -335,10 +413,10 @@ class SquareProvider(IntegrationProvider):
         else:
             variation = variations[0] if variations else None
         if not saved.get("id") or not variation or not variation.get("id"):
-            raise ValueError("Square catalog upsert returned no item/variation id.")
+            raise SquareError("Square catalog upsert returned no item/variation id.")
         return saved["id"], variation["id"]
 
-    def _set_stock_to_one(self, ctx: IntegrationContext, variation_id: str, location_id: str) -> None:
+    def _set_stock_to_one(self, ctx: IntegrationContext, variation_id: str, location_id: str, name: str) -> None:
         change = {
             "type": "PHYSICAL_COUNT",
             "physical_count": {
@@ -350,7 +428,7 @@ class SquareProvider(IntegrationProvider):
                 "occurred_at": _now_rfc3339(),
             },
         }
-        self._post(ctx, "/v2/inventory/changes/batch-create", {"idempotency_key": _new_key(), "changes": [change]}, "inventory count")
+        self._post(ctx, "/v2/inventory/changes/batch-create", {"idempotency_key": _new_key(), "changes": [change]}, f'set the stock of "{name}" to 1')
 
     @staticmethod
     def _download_image(ctx: IntegrationContext, image_url: str) -> tuple[bytes, str, str]:
@@ -396,7 +474,7 @@ class SquareProvider(IntegrationProvider):
         resp = self._delete(ctx, f"/v2/online-checkout/payment-links/{quote(payment_link_id, safe='')}")
         if resp.status_code == HTTP_NOT_FOUND:
             return False
-        self._ok_json(resp, "delete payment link")
+        self._ok_json(resp, f"delete payment link {payment_link_id}")
         return True
 
     def _checkout_options(self, ctx: IntegrationContext, slug: str, shipping_cents: int) -> dict:
@@ -408,7 +486,7 @@ class SquareProvider(IntegrationProvider):
             options["shipping_fee"] = {"name": SHIPPING_FEE_NAME, "charge": {"amount": shipping_cents, "currency": self._currency(ctx)}}
         return options
 
-    def _create_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, shipping_cents: int) -> dict:
+    def _create_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, shipping_cents: int, name: str) -> dict:
         body = {
             "idempotency_key": _new_key(),
             # Referencing the catalog variation (not quick_pay) is what ties an online sale to the
@@ -417,9 +495,9 @@ class SquareProvider(IntegrationProvider):
             "checkout_options": self._checkout_options(ctx, slug, shipping_cents),
             "payment_note": slug,
         }
-        link = self._post(ctx, "/v2/online-checkout/payment-links", body, "create payment link").get("payment_link") or {}
+        link = self._post(ctx, "/v2/online-checkout/payment-links", body, f'create the checkout link for "{name}"').get("payment_link") or {}
         if not link.get("id") or not link.get("url"):
-            raise ValueError("Square returned a payment link with no id or url.")
+            raise SquareError("Square returned a payment link with no id or url.")
         return link
 
     # ---- lifecycle --------------------------------------------------------------------------
@@ -446,8 +524,17 @@ class SquareProvider(IntegrationProvider):
         if handler is None:
             raise NotImplementedError(f"square has no action '{key}'")
         if not ctx.secret:
-            raise ValueError("No Square access token configured.")
-        return handler(args or {}, ctx)
+            raise SquareError("No Square access token configured.", CODE_CONFIG)
+        try:
+            return handler(args or {}, ctx)
+        except (SquareError, NotImplementedError):
+            raise
+        except OSError as e:  # timeouts, refused connections, DNS: Square couldn't be reached
+            raise SquareError(f"Square {key} failed: couldn't reach Square ({type(e).__name__}: {e}); try again later.", CODE_UNAVAILABLE) from e
+        except ValueError as e:
+            raise SquareError(str(e)) from e
+        except Exception as e:  # anything else must fail the step as a ValueError, not escape the workflow engine
+            raise SquareError(f"Square {key} failed: {type(e).__name__}: {e}") from e
 
     # ---- actions ----------------------------------------------------------------------------
 
@@ -457,11 +544,14 @@ class SquareProvider(IntegrationProvider):
     def _action_create_listing(self, args: dict, ctx: IntegrationContext) -> dict:
         slug, name = str(args.get("slug") or "").strip(), str(args.get("name") or "").strip()
         if not slug or not name:
-            raise ValueError("create_listing needs 'slug' and 'name'.")
+            raise SquareError("create_listing needs 'slug' and 'name'.", CODE_INVALID)
         if "price" not in args:
-            raise ValueError("create_listing needs 'price'.")
-        money = {"amount": price_cents(args["price"]), "currency": self._currency(ctx)}
-        shipping_cents = optional_fee_cents(args.get("shipping_fee"))
+            raise SquareError(f'"{name}" has no price to list it at.', CODE_INVALID)
+        try:
+            money = {"amount": price_cents(args["price"]), "currency": self._currency(ctx)}
+            shipping_cents = optional_fee_cents(args.get("shipping_fee"))
+        except ValueError as e:
+            raise SquareError(f'"{name}" can\'t be listed: {e}', CODE_INVALID) from e
         description = str(args.get("description") or "").strip()
         old_variation_id = str(args.get("variation_id") or "").strip()
         old_link_id = str(args.get("payment_link_id") or "").strip()
@@ -478,10 +568,10 @@ class SquareProvider(IntegrationProvider):
         item_id, variation_id = self._upsert_item(ctx, obj, keep_variation)
         image_id = self._maybe_attach_image(ctx, existing, item_id, image_url, name)
 
-        self._set_stock_to_one(ctx, variation_id, location_id)
+        self._set_stock_to_one(ctx, variation_id, location_id, name)
         if old_link_id:
             self._delete_link(ctx, old_link_id)
-        link = self._create_link(ctx, variation_id, location_id, slug, shipping_cents)
+        link = self._create_link(ctx, variation_id, location_id, slug, shipping_cents, name)
         return {
             "item_id": item_id,
             "variation_id": variation_id,
@@ -494,6 +584,6 @@ class SquareProvider(IntegrationProvider):
     def _action_close_listing(self, args: dict, ctx: IntegrationContext) -> dict:
         payment_link_id = str(args.get("payment_link_id") or "").strip()
         if not payment_link_id:
-            raise ValueError("close_listing needs 'payment_link_id'.")
+            raise SquareError("close_listing needs 'payment_link_id'.", CODE_INVALID)
         deleted = self._delete_link(ctx, payment_link_id)
         return {"closed": True, "already": not deleted}
