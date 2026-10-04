@@ -15,19 +15,25 @@ is the core's job.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import ClassVar
 from urllib.parse import quote
 
 from marvin_integration_sdk import (
     CATEGORY_DESTINATION,
     CredentialField,
+    ErrorPolicy,
+    Handle,
     IntegrationContext,
+    IntegrationError,
     IntegrationProvider,
     ProviderAction,
     Response,
+    Retry,
     register_provider,
 )
 
@@ -46,6 +52,7 @@ DEFAULT_ENVIRONMENT = "sandbox"
 DEFAULT_CURRENCY = "USD"
 
 ONE_OF_A_KIND = "1"  # Square quantities are decimal strings
+NONE_LEFT = "0"
 VARIATION_NAME = "Original"
 SHIPPING_FEE_NAME = "Shipping"
 SLUG_PLACEHOLDER = "{slug}"
@@ -109,27 +116,61 @@ IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg", "jpg"), (b"\x89PNG\r\n\x1a\n
 _ID = {"type": "string"}
 _AMOUNT = {"type": ["number", "string"], "description": "Dollars: a number (1170) or text ('$1,170')."}
 
+# ---- how Marvin handles each code -----------------------------------------------------------
+# Declared, never acted on here: Marvin applies the policy (review, notify, retry) to whatever workflow
+# called the action. Lookup: action[code] > provider[code] > action["*"] > provider["*"].
+ANY_CODE = "*"
+_RETRY_LATER = Handle(retry=Retry(backoff=(300,)), then=Handle(review=True, notify=True))
+ERROR_POLICY: ErrorPolicy = {
+    CODE_AUTH: Handle(notify=True),
+    CODE_CONFIG: Handle(notify=True),
+    CODE_RATE_LIMITED: Handle(retry=Retry(backoff=(60, 300, 900, 3600)), then=Handle(notify=True)),
+    CODE_UNAVAILABLE: Handle(retry=Retry(backoff=(120, 600, 1800, 7200, 21600)), then=Handle(notify=True, review=True)),
+    CODE_CONFLICT: Handle(retry=Retry(backoff=(30, 120)), then=Handle(review=True)),
+    CODE_INVALID: Handle(review=True),
+    CODE_NOT_FOUND: Handle(review=True),
+    CODE_UNKNOWN: _RETRY_LATER,
+    ANY_CODE: _RETRY_LATER,
+}
 
-def _new_key() -> str:
-    # Unique per call on purpose: Square replays the stored response for a repeated key, so a
-    # deterministic key (e.g. derived from the slug) would hand a re-listing after a price change
-    # the stale result of the first listing.
-    return str(uuid.uuid4())
+
+def _when_reconnected(attempts: int) -> Handle:
+    """A broken connection won't fix itself on a timer: tell the admins now, retry once it is healthy again."""
+    return Handle(notify=True, retry=Retry(backoff=(), on_recovery=True, max_attempts=attempts), then=Handle(review=True))
+
+
+# A listing is worth one retry after reconnecting (a later edit lists it anyway); a link left open can
+# still sell the piece, so closing keeps trying.
+CREATE_LISTING_POLICY: ErrorPolicy = {CODE_AUTH: _when_reconnected(1), CODE_CONFIG: _when_reconnected(1)}
+CLOSE_LISTING_POLICY: ErrorPolicy = {
+    CODE_AUTH: _when_reconnected(10),
+    CODE_CONFIG: _when_reconnected(10),
+    CODE_NOT_FOUND: Handle(succeed=True),  # the link (or the item) is already gone: closed
+}
+# A read is run by hand and its error shown: no retries or alerts. Every code is listed because the
+# provider's own entry for a code outranks an action's "*".
+READ_ONLY_POLICY: ErrorPolicy = {code: Handle() for code in (*CODES, ANY_CODE)}
 
 
 def _now_rfc3339() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-class SquareError(ValueError):
-    """A readable failure with a stable ``code`` (one of ``CODES``).
+def _fingerprint(*parts) -> str:
+    """Short stable digest of what a listing is made of — what makes resumed progress (and an
+    idempotency key) still valid for this attempt's input."""
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
-    Still a ValueError, so Marvin fails the workflow step with the message; a Marvin that reads the
-    ``code`` hands it on as ``${error.code}``."""
 
-    def __init__(self, message: str, code: str = CODE_UNKNOWN) -> None:
-        super().__init__(message)
-        self.code = code
+class SquareError(IntegrationError):
+    """A readable failure with a stable ``code`` (one of ``CODES``), handled by ``ERROR_POLICY``.
+
+    ``partial`` holds the steps that completed (Marvin hands it back as ``ctx.resume`` on a retry);
+    ``retry_after`` is Square's Retry-After hint on a 429. Still a ValueError underneath, so a Marvin
+    without error policies fails the step with the message as before."""
+
+    def __init__(self, message: str, code: str = CODE_UNKNOWN, *, partial: dict | None = None, retry_after: float | None = None) -> None:
+        super().__init__(message, code=code, partial=partial, retry_after=retry_after)
 
 
 def _square_errors(resp: Response) -> list[dict]:
@@ -154,12 +195,31 @@ def _describe_error(error: dict) -> str:
     return f"{text} (field {error['field']})" if error.get("field") else text
 
 
+def _retry_after(resp: Response) -> float | None:
+    """Seconds from a Retry-After header (delta-seconds or an HTTP date), or None."""
+    value = next((str(v).strip() for k, v in (resp.headers or {}).items() if k.lower() == "retry-after"), "")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
 def _http_error(resp: Response, what: str) -> SquareError:
     errors = _square_errors(resp)
     code = _code_for(resp.status_code, errors)
     detail = "; ".join(_describe_error(e) for e in errors) or resp.text[:ERROR_TEXT_LIMIT]
     hint = f" {HINTS[code]}" if code in HINTS else ""
-    return SquareError(f"Square couldn't {what} (HTTP {resp.status_code}): {detail}{hint}", code)
+    retry_after = _retry_after(resp) if code == CODE_RATE_LIMITED else None
+    return SquareError(f"Square couldn't {what} (HTTP {resp.status_code}): {detail}{hint}", code, retry_after=retry_after)
 
 
 @register_provider
@@ -184,6 +244,9 @@ class SquareProvider(IntegrationProvider):
             "notes": "Square: base64 of URL + body",
         }
     }
+
+    # How Marvin handles each failure code; create_listing and close_listing override parts of it.
+    error_policy: ClassVar[ErrorPolicy] = ERROR_POLICY
 
     credentials = (
         CredentialField(
@@ -238,6 +301,7 @@ class SquareProvider(IntegrationProvider):
                 },
             },
             cost_hint="free",
+            error_policy=READ_ONLY_POLICY,
         ),
         ProviderAction(
             key="create_listing",
@@ -269,18 +333,32 @@ class SquareProvider(IntegrationProvider):
                 "type": "object",
                 "properties": {"item_id": _ID, "variation_id": _ID, "payment_link_id": _ID, "checkout_url": _ID, "order_id": _ID, "image_id": _ID},
             },
+            error_policy=CREATE_LISTING_POLICY,
         ),
         ProviderAction(
             key="close_listing",
             label="Close listing",
-            description="Delete the checkout link (Square cancels its order). A link that is already gone counts as closed.",
+            description=(
+                "Set the item's stock to 0, then delete its checkout link (Square cancels its order). Stock goes first so a "
+                "link that can't be deleted can't sell anything; a link that is already gone counts as closed."
+            ),
             input_schema={
                 "type": "object",
-                "properties": {"payment_link_id": _ID},
+                "properties": {
+                    "payment_link_id": _ID,
+                    "variation_id": {
+                        **_ID,
+                        "description": "The listing's variation, whose stock is set to 0 first. Without it only the link is deleted.",
+                    },
+                },
                 "required": ["payment_link_id"],
                 "additionalProperties": False,
             },
-            output_schema={"type": "object", "properties": {"closed": {"type": "boolean"}, "already": {"type": "boolean"}}},
+            output_schema={
+                "type": "object",
+                "properties": {"closed": {"type": "boolean"}, "already": {"type": "boolean"}, "stock_zeroed": {"type": "boolean"}},
+            },
+            error_policy=CLOSE_LISTING_POLICY,
         ),
     )
 
@@ -403,9 +481,9 @@ class SquareProvider(IntegrationProvider):
         vdata.update({"pricing_type": "FIXED_PRICING", "price_money": money, "track_inventory": True})
         return item
 
-    def _upsert_item(self, ctx: IntegrationContext, obj: dict, variation_id: str | None) -> tuple[str, str]:
+    def _upsert_item(self, ctx: IntegrationContext, obj: dict, variation_id: str | None, key: str) -> tuple[str, str]:
         what = f'save catalog item "{(obj.get("item_data") or {}).get("name")}"'
-        data = self._post(ctx, "/v2/catalog/object", {"idempotency_key": _new_key(), "object": obj}, what)
+        data = self._post(ctx, "/v2/catalog/object", {"idempotency_key": key, "object": obj}, what)
         saved = data.get("catalog_object") or {}
         variations = (saved.get("item_data") or {}).get("variations") or []
         if variation_id:
@@ -416,19 +494,23 @@ class SquareProvider(IntegrationProvider):
             raise SquareError("Square catalog upsert returned no item/variation id.")
         return saved["id"], variation["id"]
 
-    def _set_stock_to_one(self, ctx: IntegrationContext, variation_id: str, location_id: str, name: str) -> None:
+    def _set_stock(self, ctx: IntegrationContext, variation_id: str, location_id: str, quantity: str, what: str) -> None:
+        # Docs show occurred_at in every example but do not say it is required — sent always (unverified).
+        occurred_at = _now_rfc3339()
         change = {
             "type": "PHYSICAL_COUNT",
             "physical_count": {
                 "catalog_object_id": variation_id,
                 "state": "IN_STOCK",
                 "location_id": location_id,
-                "quantity": ONE_OF_A_KIND,
-                # Docs show occurred_at in every example but do not say it is required — sent always (unverified).
-                "occurred_at": _now_rfc3339(),
+                "quantity": quantity,
+                "occurred_at": occurred_at,
             },
         }
-        self._post(ctx, "/v2/inventory/changes/batch-create", {"idempotency_key": _new_key(), "changes": [change]}, f'set the stock of "{name}" to 1')
+        # occurred_at is part of the key because it is part of the body: Square refuses a reused key with a
+        # different body. Setting a count is idempotent by nature, so a fresh key per attempt costs nothing.
+        key = ctx.idempotency_key("stock", variation_id, location_id, quantity, occurred_at)
+        self._post(ctx, "/v2/inventory/changes/batch-create", {"idempotency_key": key, "changes": [change]}, what)
 
     @staticmethod
     def _download_image(ctx: IntegrationContext, image_url: str) -> tuple[bytes, str, str]:
@@ -443,11 +525,11 @@ class SquareProvider(IntegrationProvider):
             raise ValueError(f"{image_url} is not a JPEG, PNG or GIF")
         return resp.content, *kind
 
-    def _attach_image(self, ctx: IntegrationContext, item_id: str, image_url: str, name: str) -> str:
+    def _attach_image(self, ctx: IntegrationContext, item_id: str, image_url: str, name: str, key: str) -> str:
         """Upload the picture and make it the item's primary image, which the checkout page shows."""
         data, mime, ext = self._download_image(ctx, image_url)
         request = {
-            "idempotency_key": _new_key(),
+            "idempotency_key": key,
             "object_id": item_id,
             "is_primary": True,
             "image": {"type": "IMAGE", "id": "#image", "image_data": {"name": name, "caption": name}},
@@ -458,13 +540,13 @@ class SquareProvider(IntegrationProvider):
             raise ValueError("Square returned no image id.")
         return image_id
 
-    def _maybe_attach_image(self, ctx: IntegrationContext, item: dict | None, item_id: str, image_url: str, name: str) -> str | None:
+    def _maybe_attach_image(self, ctx: IntegrationContext, item: dict | None, item_id: str, image_url: str, name: str, key: str) -> str | None:
         """Best effort: a missing picture must never cost the sale, so failures are logged, not raised.
         An item that already has a picture (an earlier listing, or one set in the dashboard) keeps it."""
         if not image_url or ((item or {}).get("item_data") or {}).get("image_ids"):
             return None
         try:
-            return self._attach_image(ctx, item_id, image_url, name)
+            return self._attach_image(ctx, item_id, image_url, name, key)
         except Exception as e:  # noqa: BLE001 — see docstring
             ctx.logger.warning("square: listed %s without a picture: %s", item_id, e)
             return None
@@ -486,9 +568,9 @@ class SquareProvider(IntegrationProvider):
             options["shipping_fee"] = {"name": SHIPPING_FEE_NAME, "charge": {"amount": shipping_cents, "currency": self._currency(ctx)}}
         return options
 
-    def _create_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, shipping_cents: int, name: str) -> dict:
+    def _create_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, shipping_cents: int, name: str, key: str) -> dict:
         body = {
-            "idempotency_key": _new_key(),
+            "idempotency_key": key,
             # Referencing the catalog variation (not quick_pay) is what ties an online sale to the
             # same inventory the card reader decrements.
             "order": {"location_id": location_id, "line_items": [{"catalog_object_id": variation_id, "quantity": ONE_OF_A_KIND}]},
@@ -525,23 +607,52 @@ class SquareProvider(IntegrationProvider):
             raise NotImplementedError(f"square has no action '{key}'")
         if not ctx.secret:
             raise SquareError("No Square access token configured.", CODE_CONFIG)
+        # The steps an action completes, recorded as it goes. On failure it rides on the error as `partial`
+        # so the retry (ctx.resume) skips them. Just the input fingerprint is no progress worth keeping.
+        progress: dict = {}
+
+        def partial() -> dict | None:
+            return dict(progress) if set(progress) - {"for"} else None
+
         try:
-            return handler(args or {}, ctx)
-        except (SquareError, NotImplementedError):
+            return handler(args or {}, ctx, progress)
+        except NotImplementedError:
+            raise
+        except SquareError as e:
+            e.partial = e.partial or partial()
             raise
         except OSError as e:  # timeouts, refused connections, DNS: Square couldn't be reached
-            raise SquareError(f"Square {key} failed: couldn't reach Square ({type(e).__name__}: {e}); try again later.", CODE_UNAVAILABLE) from e
+            message = f"Square {key} failed: couldn't reach Square ({type(e).__name__}: {e}); try again later."
+            raise SquareError(message, CODE_UNAVAILABLE, partial=partial()) from e
         except ValueError as e:
-            raise SquareError(str(e)) from e
+            raise SquareError(str(e), partial=partial()) from e
         except Exception as e:  # anything else must fail the step as a ValueError, not escape the workflow engine
-            raise SquareError(f"Square {key} failed: {type(e).__name__}: {e}") from e
+            raise SquareError(f"Square {key} failed: {type(e).__name__}: {e}", partial=partial()) from e
 
     # ---- actions ----------------------------------------------------------------------------
 
-    def _action_list_locations(self, args: dict, ctx: IntegrationContext) -> dict:
+    def _action_list_locations(self, args: dict, ctx: IntegrationContext, progress: dict) -> dict:
         return {"locations": self._list_locations(ctx)}
 
-    def _action_create_listing(self, args: dict, ctx: IntegrationContext) -> dict:
+    @staticmethod
+    def _resume_listing(ctx: IntegrationContext, fingerprint: str, progress: dict) -> None:
+        """Carry an earlier attempt's progress into this one.
+
+        The catalog item it saved is always reused, so a retry never makes a duplicate item. Its other
+        steps count as done only if the listing's input is unchanged; if the price (say) changed since,
+        they are redone, and the link that attempt made is retired with the old one — it sells at the old price."""
+        resume = ctx.resume if isinstance(ctx.resume, dict) else {}
+        progress.update({k: resume[k] for k in ("item_id", "variation_id") if resume.get(k)})
+        retire = [link for link in resume.get("retire_link_ids") or [] if link]
+        if resume.get("for") == fingerprint:
+            progress.update({k: resume[k] for k in ("saved", "image_id", "stock_set", "payment_link_id", "checkout_url", "order_id") if k in resume})
+        elif resume.get("payment_link_id"):
+            retire.append(resume["payment_link_id"])
+        if retire:
+            progress["retire_link_ids"] = retire
+        progress["for"] = fingerprint
+
+    def _action_create_listing(self, args: dict, ctx: IntegrationContext, progress: dict) -> dict:
         slug, name = str(args.get("slug") or "").strip(), str(args.get("name") or "").strip()
         if not slug or not name:
             raise SquareError("create_listing needs 'slug' and 'name'.", CODE_INVALID)
@@ -557,33 +668,74 @@ class SquareProvider(IntegrationProvider):
         old_link_id = str(args.get("payment_link_id") or "").strip()
         image_url = str(args.get("image_url") or "").strip()
         location_id = self._location_id(ctx)
+        fingerprint = _fingerprint(slug, name, description, money, image_url, location_id, self._checkout_options(ctx, slug, shipping_cents))
+        self._resume_listing(ctx, fingerprint, progress)
 
-        existing = self._fetch_item_for_variation(ctx, old_variation_id) if old_variation_id else None
-        if old_variation_id and existing is None:
-            ctx.logger.warning("square: variation %s no longer exists; creating a new catalog item for %s", old_variation_id, slug)
-        if existing is not None:
-            obj, keep_variation = self._updated_item(existing, old_variation_id, name, description, money), old_variation_id
-        else:
-            obj, keep_variation = self._new_item(name, description, money), None
-        item_id, variation_id = self._upsert_item(ctx, obj, keep_variation)
-        image_id = self._maybe_attach_image(ctx, existing, item_id, image_url, name)
+        # 1. The catalog item (and its picture, best effort). Keys repeat across one retry chain for the same
+        # body, so a request Square already did (its answer lost) is replayed, not done twice.
+        if not progress.get("saved"):
+            update_variation = progress.get("variation_id") or old_variation_id
+            existing = self._fetch_item_for_variation(ctx, update_variation) if update_variation else None
+            if update_variation and existing is None:
+                ctx.logger.warning("square: variation %s no longer exists; creating a new catalog item for %s", update_variation, slug)
+            if existing is not None:
+                obj, keep_variation = self._updated_item(existing, update_variation, name, description, money), update_variation
+            else:
+                obj, keep_variation = self._new_item(name, description, money), None
+            key = ctx.idempotency_key("item", fingerprint, keep_variation or "new", (existing or {}).get("version"))
+            item_id, variation_id = self._upsert_item(ctx, obj, keep_variation, key)
+            progress.update(item_id=item_id, variation_id=variation_id, saved=True)
+            progress["image_id"] = self._maybe_attach_image(
+                ctx, existing, item_id, image_url, name, ctx.idempotency_key("image", fingerprint, item_id)
+            )
+        item_id, variation_id = progress["item_id"], progress["variation_id"]
 
-        self._set_stock_to_one(ctx, variation_id, location_id, name)
-        if old_link_id:
-            self._delete_link(ctx, old_link_id)
-        link = self._create_link(ctx, variation_id, location_id, slug, shipping_cents, name)
+        # 2. Stock of exactly 1.
+        if not progress.get("stock_set"):
+            self._set_stock(ctx, variation_id, location_id, ONE_OF_A_KIND, f'set the stock of "{name}" to 1')
+            progress["stock_set"] = True
+
+        # 3. The new link — before the old one goes, so the item is never left without a way to buy it.
+        if not progress.get("payment_link_id"):
+            key = ctx.idempotency_key("link", fingerprint, variation_id)
+            link = self._create_link(ctx, variation_id, location_id, slug, shipping_cents, name, key)
+            progress.update(payment_link_id=link["id"], checkout_url=link["url"], order_id=link.get("order_id"))
+
+        # 4. Retire the old link, and any an earlier attempt made for different input.
+        for link_id in dict.fromkeys([old_link_id, *progress.get("retire_link_ids", [])]):
+            if link_id and link_id != progress["payment_link_id"]:
+                self._delete_link(ctx, link_id)
+                progress["retire_link_ids"] = [x for x in progress.get("retire_link_ids", []) if x != link_id]
         return {
             "item_id": item_id,
             "variation_id": variation_id,
-            "payment_link_id": link["id"],
-            "checkout_url": link["url"],
-            "order_id": link.get("order_id"),
-            "image_id": image_id,
+            "payment_link_id": progress["payment_link_id"],
+            "checkout_url": progress["checkout_url"],
+            "order_id": progress.get("order_id"),
+            "image_id": progress.get("image_id"),
         }
 
-    def _action_close_listing(self, args: dict, ctx: IntegrationContext) -> dict:
+    def _action_close_listing(self, args: dict, ctx: IntegrationContext, progress: dict) -> dict:
         payment_link_id = str(args.get("payment_link_id") or "").strip()
         if not payment_link_id:
             raise SquareError("close_listing needs 'payment_link_id'.", CODE_INVALID)
+        variation_id = str(args.get("variation_id") or "").strip()
+        resume = ctx.resume if isinstance(ctx.resume, dict) else {}
+        progress["for"] = payment_link_id
+        if resume.get("for") == payment_link_id and resume.get("stock_zeroed"):
+            progress["stock_zeroed"] = True
+
+        # Stock first: if the link then can't be deleted, it has nothing left to sell.
+        if variation_id and not progress.get("stock_zeroed"):
+            try:
+                self._set_stock(ctx, variation_id, self._location_id(ctx), NONE_LEFT, f"set the stock of variation {variation_id} to 0")
+            except SquareError as e:
+                if e.code != CODE_NOT_FOUND:
+                    raise
+                ctx.logger.info("square: variation %s is gone; nothing left to sell", variation_id)
+            progress["stock_zeroed"] = True
+        elif not variation_id:
+            ctx.logger.warning("square: closing %s without a variation_id, so its stock is left as it is", payment_link_id)
+
         deleted = self._delete_link(ctx, payment_link_id)
-        return {"closed": True, "already": not deleted}
+        return {"closed": True, "already": not deleted, "stock_zeroed": bool(progress.get("stock_zeroed"))}

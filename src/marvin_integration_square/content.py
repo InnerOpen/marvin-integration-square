@@ -15,6 +15,11 @@ Sites stay provider-neutral: the workflows store the Buy-button link as `checkou
 `checkout_provider: square`) and mark `checkout_closed` once sold — keys any commerce integration can
 write. Square's own ids stay under `square_*`.
 
+Closing is ordered so a Square failure can't leave the piece for sale: first `checkout_closed: true` and a
+site rebuild (the Buy button goes), then `close_listing` (stock to 0, then the link deleted), and only once
+that succeeds `square_link_closed: true`. The close workflows run while `square_link_closed` isn't true, so
+a retry Marvin schedules for a failed close still passes their conditions after the button is gone.
+
 Two parameters keep it general: `entry_type` (which type is the shop's items, default `artwork`) and
 `integration` (this integration's slug in the workspace, default `square`).
 """
@@ -128,6 +133,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "checkout_url": "${steps.listing.output.checkout_url}",
                         "checkout_provider": "square",
                         "checkout_closed": False,
+                        "square_link_closed": False,
                         "square_listed_for": "${entry.data.price}|${entry.data.shippingFee}",
                     },
                 },
@@ -141,72 +147,64 @@ MARK_SOLD = ContentBlueprint(
     kind="workflow",
     slug="square-mark-sold",
     name="Square: mark sold",
-    description="When Square reports an item's stock reached 0 — sold online or on a card reader — set its status to sold.",
+    description=(
+        "When Square reports an item's stock reached 0 — sold online or on a card reader — set its status to sold. "
+        "Stock that Marvin zeroed itself while closing the listing is not a sale."
+    ),
     required=True,
     category=CATEGORY,
     parameters=(ENTRY_TYPE_PARAM,),
     payload={
         "definition": {
             "trigger": {"type": "incoming_webhook", "webhook": WEBHOOK_SLUG},
+            # A target, not an entity_query, so the item's own metadata can be checked: closing a listing sets
+            # `checkout_closed` before it zeroes the stock, and that zero must not mark a withdrawn item sold.
+            # A count for a catalog item no entry lists matches nothing and does nothing.
+            "target": {
+                "entity": "entry",
+                "query": {
+                    "entry_type": "{{entry_type}}",
+                    "metadata": {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"},
+                },
+            },
             "conditions": [
                 {"field": "event.payload.type", "op": "eq", "value": "inventory.count.updated"},
                 {"field": "event.payload.data.object.inventory_counts.0.state", "op": "eq", "value": "IN_STOCK"},
                 {"field": "event.payload.data.object.inventory_counts.0.quantity", "op": "eq", "value": "0"},
+                {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True},
             ],
-            "actions": [
-                {
-                    "kind": "entry",
-                    "op": "set_data",
-                    "data": {"status": "sold"},
-                    "entity_query": {
-                        "entry_type": "{{entry_type}}",
-                        "metadata": {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"},
-                    },
-                },
-            ],
+            "actions": [{"kind": "entry", "op": "set_data", "data": {"status": "sold"}}],
         }
     },
 )
 
-CLOSE_WHEN_SOLD = ContentBlueprint(
-    kind="workflow",
-    slug="square-close-when-sold",
-    name="Square: close the link when sold",
-    description="When an item's status becomes sold (by a sale or by hand), close its Square checkout link and rebuild the site. Runs once per item.",
-    required=True,
-    category=CATEGORY,
-    parameters=(ENTRY_TYPE_PARAM, INTEGRATION_PARAM),
-    payload={
-        "definition": {
-            "trigger": {"type": "event", "event": "entry_updated"},
-            "conditions": [
-                {"field": "entry.entry_type", "op": "eq", "value": "{{entry_type}}"},
-                {"field": "entry.data.status", "op": "eq", "value": "sold"},
-                {"field": "entry.metadata.square_payment_link_id", "op": "exists"},
-                # The marker set below: without it, every later edit of a sold item would close and rebuild again.
-                # A re-listing sets it back to false, so the next sale closes the new link too.
-                {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True},
-            ],
-            "actions": [
-                {
-                    "kind": "integration",
-                    "integration": "{{integration}}",
-                    "action": "close_listing",
-                    "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}"},
-                },
-                # "closed" never equals a price|shipping, so setting the item back to available re-lists it.
-                {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True, "square_listed_for": "closed"}},
-                {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square sale"}},
-            ],
-        }
-    },
-)
+
+def _close_steps(reason: str) -> list[dict]:
+    """Hide the Buy button before touching Square, so a close that fails (and is retried) never leaves the
+    piece for sale on the site. `square_listed_for: closed` never equals a price|shipping, so putting the
+    item back on sale lists it again."""
+    return [
+        {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True, "square_listed_for": "closed"}},
+        {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": reason}},
+        {
+            "kind": "integration",
+            "integration": "{{integration}}",
+            "action": "close_listing",
+            "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}", "variation_id": "${entry.metadata.square_variation_id}"},
+        },
+        {"kind": "entry", "op": "set_metadata", "metadata": {"square_link_closed": True}},
+    ]
+
+
+# The marker that stops a repeat close. It is set only once Square confirms, so a retry of a failed close
+# still passes; a re-listing sets it back to false, so the next sale closes the new link too.
+LINK_OPEN = {"field": "entry.metadata.square_link_closed", "op": "neq", "value": True}
 
 
 def _close_when(slug: str, name: str, description: str, event: str, conditions: list[dict], reason: str) -> ContentBlueprint:
-    """A workflow that closes an item's open checkout link when it stops being for sale. Same marker as
-    close-when-sold: `checkout_closed` stops a repeat, and `square_listed_for: closed` means switching it
-    back on (or republishing) lists it again."""
+    """A workflow that closes an item's open checkout link when it stops being for sale. Its conditions
+    must also hold for a retry hours later: they describe the item still being out of the shop, so one
+    put back on sale meanwhile drops the retry instead of closing its new link."""
     return ContentBlueprint(
         kind="workflow",
         slug=slug,
@@ -222,21 +220,22 @@ def _close_when(slug: str, name: str, description: str, event: str, conditions: 
                     {"field": "entry.entry_type", "op": "eq", "value": "{{entry_type}}"},
                     *conditions,
                     {"field": "entry.metadata.square_payment_link_id", "op": "exists"},
-                    {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True},
+                    LINK_OPEN,
                 ],
-                "actions": [
-                    {
-                        "kind": "integration",
-                        "integration": "{{integration}}",
-                        "action": "close_listing",
-                        "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}"},
-                    },
-                    {"kind": "entry", "op": "set_metadata", "metadata": {"checkout_closed": True, "square_listed_for": "closed"}},
-                    {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": reason}},
-                ],
+                "actions": _close_steps(reason),
             }
         },
     )
+
+
+CLOSE_WHEN_SOLD = _close_when(
+    "square-close-when-sold",
+    "Square: close the link when sold",
+    "When an item's status becomes sold (by a sale or by hand), hide its Buy button, rebuild the site and close its Square checkout link. Runs once per item.",
+    "entry_updated",
+    [{"field": "entry.data.status", "op": "eq", "value": "sold"}],
+    "square sale",
+)
 
 
 # Taking an item out of the shop any other way than a sale must close its link too — or a buyer could still
@@ -244,7 +243,7 @@ def _close_when(slug: str, name: str, description: str, event: str, conditions: 
 CLOSE_WHEN_WITHDRAWN = _close_when(
     "square-close-when-withdrawn",
     "Square: close the link when Sell online is switched off",
-    "When an item's Sell online is switched off, close its Square checkout link and rebuild the site. Switching it back on lists it again.",
+    "When an item's Sell online is switched off, hide its Buy button, rebuild the site and close its Square checkout link. Switching it back on lists it again.",
     "entry_updated",
     [{"field": "entry.data.sellOnline", "op": "neq", "value": True}],
     "square listing withdrawn",
@@ -252,17 +251,17 @@ CLOSE_WHEN_WITHDRAWN = _close_when(
 CLOSE_WHEN_UNPUBLISHED = _close_when(
     "square-close-when-unpublished",
     "Square: close the link when unpublished",
-    "When an item is unpublished, close its Square checkout link and rebuild the site. Republishing lists it again.",
+    "When an item is unpublished, hide its Buy button, rebuild the site and close its Square checkout link. Republishing lists it again.",
     "entry_unpublished",
-    [],
+    [{"field": "entry.status", "op": "neq", "value": "published"}],
     "square listing unpublished",
 )
 CLOSE_WHEN_ARCHIVED = _close_when(
     "square-close-when-archived",
     "Square: close the link when archived",
-    "When an item is archived, close its Square checkout link and rebuild the site. Restoring and republishing lists it again.",
+    "When an item is archived, hide its Buy button, rebuild the site and close its Square checkout link. Restoring and republishing lists it again.",
     "entry_archived",
-    [],
+    [{"field": "entry.status", "op": "eq", "value": "archived"}],
     "square listing archived",
 )
 

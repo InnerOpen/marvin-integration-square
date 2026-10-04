@@ -2,9 +2,11 @@
 
 import json
 import logging
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 import pytest
-from marvin_integration_sdk import IntegrationContext, Response
+from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError, Response, Retry, resolve_policy
 
 from marvin_integration_square import SquareProvider
 from marvin_integration_square.provider import (
@@ -82,10 +84,10 @@ class _StubHttp:
 
     def _answer(self, method, url, body=None, headers=None, data=None):
         self.calls.append({"method": method, "url": url, "json": body, "headers": headers, "data": data})
-        for route_method, needle, status, payload in self.routes:
+        for route_method, needle, status, payload, *response_headers in self.routes:
             if route_method == method and needle in url:
                 content = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
-                return Response(status_code=status, content=content)
+                return Response(status_code=status, content=content, headers=response_headers[0] if response_headers else {})
         return Response(status_code=599, content=b'{"errors":[{"detail":"no stub route"}]}')
 
     def get(self, url, *, headers=None, timeout=15):
@@ -120,14 +122,14 @@ def _listing_http(upsert=NEW_ITEM, delete_status=200, upsert_status=200, retriev
     )
 
 
-def _ctx(http=None, secret="tok", **config):
+def _ctx(http=None, secret="tok", resume=None, seed=None, **config):
     cfg = {"environment": "sandbox", "location_id": LOCATION, "redirect_url": "https://art.example/sold/{slug}", **config}
-    return IntegrationContext(config=cfg, secret=secret, logger=_LOG, http=http or _listing_http())
+    return IntegrationContext(config=cfg, secret=secret, logger=_LOG, http=http or _listing_http(), resume=resume, idempotency_seed=seed)
 
 
-def _list(http, **args):
+def _list(http, resume=None, seed=None, **args):
     base = {"slug": "blue-hour", "name": "Blue Hour", "price": "$1,170"}
-    return SquareProvider().run_action("create_listing", {**base, **args}, _ctx(http))
+    return SquareProvider().run_action("create_listing", {**base, **args}, _ctx(http, resume=resume, seed=seed))
 
 
 # ---- create_listing -------------------------------------------------------------------------
@@ -218,15 +220,16 @@ def test_create_listing_without_shipping_fee_has_none(fee):
     assert "shipping_fee" not in http.body("POST", "/online-checkout/payment-links")["checkout_options"]
 
 
-def test_create_listing_with_existing_ids_updates_item_and_replaces_link():
+def test_create_listing_with_existing_ids_updates_item_and_replaces_link_new_one_first():
     http = _listing_http(upsert=UPDATED_ITEM)
     out = _list(http, variation_id="VAR0", payment_link_id="OLD", price=900)
+    # The old link goes only once the new one exists, so the item is never left without a way to buy it.
     assert http.paths() == [
         ("GET", "/v2/catalog/object/VAR0?include_related_objects=true"),
         ("POST", "/v2/catalog/object"),
         ("POST", "/v2/inventory/changes/batch-create"),
-        ("DELETE", "/v2/online-checkout/payment-links/OLD"),
         ("POST", "/v2/online-checkout/payment-links"),
+        ("DELETE", "/v2/online-checkout/payment-links/OLD"),
     ]
     assert out["item_id"] == "ITEM0" and out["variation_id"] == "VAR0"
 
@@ -307,7 +310,7 @@ def test_every_call_sends_auth_and_version_headers():
 def test_close_listing_deletes_link(status, already):
     http = _listing_http(delete_status=status)
     out = SquareProvider().run_action("close_listing", {"payment_link_id": "PL1"}, _ctx(http))
-    assert out == {"closed": True, "already": already}
+    assert out == {"closed": True, "already": already, "stock_zeroed": False}
     assert http.paths() == [("DELETE", "/v2/online-checkout/payment-links/PL1")]
 
 
@@ -506,10 +509,10 @@ def test_taking_an_item_out_of_the_shop_closes_its_link(slug, event):
     assert definition["trigger"] == {"type": "event", "event": event}
     assert [a.get("action") for a in definition["actions"] if a["kind"] == "integration"] == ["close_listing"]
     marker = next(a for a in definition["actions"] if a.get("op") == "set_metadata")["metadata"]
-    # Same marker as close-when-sold: no repeat close, and switching back on lists it again.
+    # Same marker as close-when-sold: the Buy button goes, and switching back on lists it again.
     assert marker == {"checkout_closed": True, "square_listed_for": "closed"}
     fields = {c["field"] for c in definition["conditions"]}
-    assert {"entry.metadata.square_payment_link_id", "entry.metadata.checkout_closed"} <= fields
+    assert {"entry.metadata.square_payment_link_id", "entry.metadata.square_link_closed"} <= fields
 
 
 def test_switching_sell_online_off_is_what_withdraws_it():
@@ -573,7 +576,9 @@ def test_error_codes_are_the_documented_stable_strings():
 
 
 def test_square_error_is_still_a_value_error_for_the_engine():
-    assert issubclass(SquareError, ValueError)
+    assert issubclass(SquareError, IntegrationError) and issubclass(SquareError, ValueError)
+    error = SquareError("x", CODE_CONFLICT, partial={"a": 1}, retry_after=5)
+    assert (error.code, error.partial, error.retry_after) == (CODE_CONFLICT, {"a": 1}, 5)
 
 
 def test_auth_failure_says_to_check_the_token_and_environment():
@@ -669,3 +674,328 @@ def test_list_locations_failure_is_coded():
     with pytest.raises(SquareError, match="list locations") as raised:
         SquareProvider().run_action("list_locations", {}, _ctx(http))
     assert raised.value.code == CODE_RATE_LIMITED
+
+
+# ---- error policy ---------------------------------------------------------------------------
+
+_REVIEW = Handle(review=True)
+_RETRY_LATER = Handle(retry=Retry(backoff=(300,)), then=Handle(review=True, notify=True))
+
+
+def _when_reconnected(attempts):
+    return Handle(notify=True, retry=Retry(backoff=(), on_recovery=True, max_attempts=attempts), then=_REVIEW)
+
+
+@pytest.mark.parametrize(
+    ("action", "code", "handle"),
+    [
+        ("create_listing", CODE_AUTH, _when_reconnected(1)),
+        ("create_listing", CODE_CONFIG, _when_reconnected(1)),
+        ("close_listing", CODE_AUTH, _when_reconnected(10)),
+        ("close_listing", CODE_CONFIG, _when_reconnected(10)),
+        ("create_listing", CODE_RATE_LIMITED, Handle(retry=Retry(backoff=(60, 300, 900, 3600)), then=Handle(notify=True))),
+        ("close_listing", CODE_RATE_LIMITED, Handle(retry=Retry(backoff=(60, 300, 900, 3600)), then=Handle(notify=True))),
+        ("create_listing", CODE_UNAVAILABLE, Handle(retry=Retry(backoff=(120, 600, 1800, 7200, 21600)), then=Handle(notify=True, review=True))),
+        ("close_listing", CODE_UNAVAILABLE, Handle(retry=Retry(backoff=(120, 600, 1800, 7200, 21600)), then=Handle(notify=True, review=True))),
+        ("create_listing", CODE_CONFLICT, Handle(retry=Retry(backoff=(30, 120)), then=_REVIEW)),
+        ("close_listing", CODE_CONFLICT, Handle(retry=Retry(backoff=(30, 120)), then=_REVIEW)),
+        ("create_listing", CODE_INVALID, _REVIEW),
+        ("close_listing", CODE_INVALID, _REVIEW),
+        ("create_listing", CODE_NOT_FOUND, _REVIEW),
+        ("close_listing", CODE_NOT_FOUND, Handle(succeed=True)),
+        ("create_listing", CODE_UNKNOWN, _RETRY_LATER),
+        ("close_listing", CODE_UNKNOWN, _RETRY_LATER),
+        ("create_listing", "something_new", _RETRY_LATER),
+        ("close_listing", "something_new", _RETRY_LATER),
+    ],
+)
+def test_error_policy_resolves_per_action_and_code(action, code, handle):
+    assert resolve_policy(SquareProvider, action, code) == handle
+
+
+@pytest.mark.parametrize("code", [*CODES, "something_new"])
+def test_list_locations_failures_plainly_fail(code):
+    # Every code is listed on the action: the provider's entry for a code would otherwise outrank an action "*".
+    assert resolve_policy(SquareProvider, "list_locations", code) == Handle()
+
+
+def test_error_policy_is_registered_and_shown_in_the_catalog():
+    from marvin_integration_sdk import get_provider
+
+    policy = get_provider("square").info()["error_policy"]
+    assert set(policy["provider"]) == {*CODES, "*"}
+    assert set(policy["actions"]["close_listing"]) == {CODE_AUTH, CODE_CONFIG, CODE_NOT_FOUND}
+    assert set(policy["actions"]["create_listing"]) == {CODE_AUTH, CODE_CONFIG}
+    assert policy["actions"]["close_listing"][CODE_NOT_FOUND]["summary"] == "treat as success"
+    assert policy["provider"][CODE_UNAVAILABLE]["summary"] == "retry 5× (2m, 10m, 30m, 2h, 6h), then notify admins, send to review"
+
+
+def _rate_limited(headers):
+    return _StubHttp([("GET", "/v2/locations", 429, _square_error("RATE_LIMIT_ERROR", "RATE_LIMITED"), headers)])
+
+
+def _locations_error(http) -> SquareError:
+    with pytest.raises(SquareError) as raised:
+        SquareProvider().run_action("list_locations", {}, _ctx(http))
+    return raised.value
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"), [({"Retry-After": "120"}, 120.0), ({"retry-after": "7.5"}, 7.5), ({}, None), ({"Retry-After": "soon"}, None)]
+)
+def test_rate_limited_carries_square_retry_after(headers, expected):
+    error = _locations_error(_rate_limited(headers))
+    assert (error.code, error.retry_after) == (CODE_RATE_LIMITED, expected)
+
+
+def test_retry_after_as_an_http_date():
+    when = format_datetime(datetime.now(UTC) + timedelta(seconds=600), usegmt=True)
+    assert 590 <= _locations_error(_rate_limited({"Retry-After": when})).retry_after <= 600
+
+
+def test_retry_after_is_only_read_on_rate_limiting():
+    http = _StubHttp([("GET", "/v2/locations", 503, b"", {"Retry-After": "120"})])
+    assert _locations_error(http).retry_after is None
+
+
+# ---- closing safely: stock first, then the link ----------------------------------------------
+
+
+def _close(http, resume=None, **args):
+    return SquareProvider().run_action("close_listing", {"payment_link_id": "PL1", "variation_id": "VAR1", **args}, _ctx(http, resume=resume))
+
+
+def _close_fails_with(http, resume=None) -> SquareError:
+    with pytest.raises(SquareError) as raised:
+        _close(http, resume)
+    return raised.value
+
+
+def test_close_listing_zeroes_stock_before_deleting_the_link():
+    http = _listing_http()
+    out = _close(http)
+    assert http.paths() == [("POST", "/v2/inventory/changes/batch-create"), ("DELETE", "/v2/online-checkout/payment-links/PL1")]
+    (change,) = http.body("POST", "/inventory/changes/batch-create")["changes"]
+    count = change["physical_count"]
+    assert (change["type"], count["catalog_object_id"], count["state"], count["location_id"], count["quantity"]) == (
+        "PHYSICAL_COUNT",
+        "VAR1",
+        "IN_STOCK",
+        LOCATION,
+        "0",
+    )
+    assert out == {"closed": True, "already": False, "stock_zeroed": True}
+
+
+def test_close_listing_link_failure_after_zeroing_keeps_the_progress():
+    error = _close_fails_with(_listing_http(delete_status=500))
+    assert (error.code, error.partial) == (CODE_UNAVAILABLE, {"for": "PL1", "stock_zeroed": True})
+
+
+def test_close_listing_resume_skips_the_zeroed_stock():
+    http = _listing_http()
+    out = _close(http, resume={"for": "PL1", "stock_zeroed": True})
+    assert http.paths() == [("DELETE", "/v2/online-checkout/payment-links/PL1")]
+    assert out["stock_zeroed"] is True
+
+
+def test_close_listing_ignores_progress_saved_for_another_link():
+    http = _listing_http()
+    _close(http, resume={"for": "PL0", "stock_zeroed": True})
+    assert http.paths()[0] == ("POST", "/v2/inventory/changes/batch-create")
+
+
+def test_close_listing_link_already_gone_after_zeroing_is_success():
+    out = _close(_listing_http(delete_status=404))
+    assert out == {"closed": True, "already": True, "stock_zeroed": True}
+
+
+def test_close_listing_with_the_variation_gone_still_deletes_the_link():
+    http = _failing("POST", "/v2/inventory/changes/batch-create", 404, _square_error("INVALID_REQUEST_ERROR", "NOT_FOUND"))
+    assert _close(http)["closed"] is True
+    assert http.paths()[-1] == ("DELETE", "/v2/online-checkout/payment-links/PL1")
+
+
+def test_close_listing_stock_failure_leaves_the_link_and_no_progress():
+    http = _failing("POST", "/v2/inventory/changes/batch-create", 503, b"")
+    error = _close_fails_with(http)
+    assert (error.code, error.partial, "set the stock of variation VAR1 to 0" in str(error)) == (CODE_UNAVAILABLE, None, True)
+    assert not any(c["method"] == "DELETE" for c in http.calls)
+
+
+# ---- create_listing: partial progress and resume ---------------------------------------------
+
+LINK_PATHS = [("POST", "/v2/online-checkout/payment-links"), ("DELETE", "/v2/online-checkout/payment-links/OLD")]
+
+
+def test_create_listing_link_failure_keeps_the_item_and_never_deletes_the_old_link():
+    http = _failing("POST", "/v2/online-checkout/payment-links", 503, b"")
+    error = _list_fails_with(http, payment_link_id="OLD")
+    assert error.code == CODE_UNAVAILABLE
+    assert {k: error.partial[k] for k in ("item_id", "variation_id", "saved", "stock_set")} == {
+        "item_id": "ITEM1",
+        "variation_id": "VAR1",
+        "saved": True,
+        "stock_set": True,
+    }
+    assert "payment_link_id" not in error.partial
+    assert not any(c["method"] == "DELETE" for c in http.calls)
+
+
+def test_create_listing_upsert_failure_has_no_progress():
+    error = _list_fails_with(_listing_http(upsert_status=400))
+    assert error.partial is None
+
+
+def test_create_listing_resume_after_stock_failure_reuses_the_item():
+    first = _list_fails_with(_failing("POST", "/v2/inventory/changes/batch-create", 503, b""), payment_link_id="OLD")
+    http = _listing_http()
+    out = _list(http, resume=first.partial, payment_link_id="OLD")
+    assert http.paths() == [("POST", "/v2/inventory/changes/batch-create"), *LINK_PATHS]  # no second catalog item
+    assert (out["item_id"], out["variation_id"], out["payment_link_id"]) == ("ITEM1", "VAR1", "PL1")
+
+
+def test_create_listing_resume_that_only_needs_the_old_link_deleted_does_just_that():
+    first = _list_fails_with(_failing("DELETE", "/v2/online-checkout/payment-links/", 503, b""), payment_link_id="OLD")
+    assert (first.partial["payment_link_id"], first.partial["checkout_url"]) == ("PL1", "https://square.link/u/abc")
+    http = _listing_http()
+    out = _list(http, resume=first.partial, payment_link_id="OLD")
+    assert http.paths() == [("DELETE", "/v2/online-checkout/payment-links/OLD")]
+    assert out == {
+        "item_id": "ITEM1",
+        "variation_id": "VAR1",
+        "payment_link_id": "PL1",
+        "checkout_url": "https://square.link/u/abc",
+        "order_id": "ORD1",
+        "image_id": None,
+    }
+
+
+def test_create_listing_resume_after_a_price_change_updates_the_same_item_and_retires_its_link():
+    first = _list_fails_with(_failing("DELETE", "/v2/online-checkout/payment-links/", 503, b""), payment_link_id="OLD")
+    http = _listing_http(upsert=UPDATED_ITEM)
+    http.routes.insert(0, ("POST", "/v2/online-checkout/payment-links", 200, {"payment_link": {"id": "PL2", "url": "https://square.link/u/new"}}))
+    first.partial["variation_id"] = "VAR0"  # the stubbed catalog answers for VAR0
+    out = _list(http, resume=first.partial, payment_link_id="OLD", price=900)
+    assert http.body("POST", "/v2/catalog/object")["object"]["id"] == "ITEM0"  # updated in place, not a new "#item"
+    deleted = [path for method, path in http.paths() if method == "DELETE"]
+    assert deleted == ["/v2/online-checkout/payment-links/OLD", "/v2/online-checkout/payment-links/PL1"]  # PL1 sold at the old price
+    assert out["payment_link_id"] == "PL2"
+
+
+def test_create_listing_retiring_a_stale_link_that_fails_keeps_it_for_the_next_try():
+    stale = {"for": "older-input", "item_id": "ITEM0", "variation_id": "VAR0", "payment_link_id": "STALE"}
+    http = _listing_http(upsert=UPDATED_ITEM)
+    http.routes.insert(0, ("DELETE", "/payment-links/STALE", 503, b""))
+    with pytest.raises(SquareError) as raised:
+        _list(http, resume=stale)
+    assert raised.value.partial["retire_link_ids"] == ["STALE"]
+    assert raised.value.partial["payment_link_id"] == "PL1"
+
+
+class _UnreachableStock(_StubHttp):
+    def post(self, url, **kwargs):
+        if "/inventory/" in url:
+            raise TimeoutError("timed out")
+        return super().post(url, **kwargs)
+
+
+def test_create_listing_network_error_midway_keeps_the_progress():
+    error = _list_fails_with(_UnreachableStock(_listing_http().routes))
+    assert (error.code, error.partial["item_id"], error.partial.get("stock_set")) == (CODE_UNAVAILABLE, "ITEM1", None)
+
+
+# ---- idempotency keys -----------------------------------------------------------------------
+
+
+def _keys(http):
+    return {c["url"].split(".com", 1)[1]: (c["json"] or {}).get("idempotency_key") for c in http.calls if c["method"] == "POST" and c["json"]}
+
+
+def test_idempotency_keys_repeat_within_one_retry_chain():
+    first, second = _listing_http(), _listing_http()
+    _list(first, seed="chain-1")
+    _list(second, seed="chain-1")
+    for path in ("/v2/catalog/object", "/v2/online-checkout/payment-links"):
+        assert _keys(first)[path] == _keys(second)[path]
+
+
+def test_idempotency_keys_differ_between_chains_and_after_a_price_change():
+    base, other_chain, new_price = _listing_http(), _listing_http(), _listing_http()
+    _list(base, seed="chain-1")
+    _list(other_chain, seed="chain-2")
+    _list(new_price, seed="chain-1", price=900)
+    for path in ("/v2/catalog/object", "/v2/online-checkout/payment-links"):
+        assert len({_keys(base)[path], _keys(other_chain)[path], _keys(new_price)[path]}) == 3
+
+
+def _upload_key(http):
+    request = _upload(http)["data"].split(b'name="request"', 1)[1].split(b"\r\n\r\n", 1)[1].split(b"\r\n--", 1)[0]
+    return json.loads(request)["idempotency_key"]
+
+
+def test_image_upload_key_repeats_within_one_retry_chain():
+    first, second = _picture_http(), _picture_http()
+    _list(first, seed="chain-1", image_url=PICTURE_URL)
+    _list(second, seed="chain-1", image_url=PICTURE_URL)
+    assert _upload_key(first) == _upload_key(second)
+
+
+# ---- workflows: close order and the square_link_closed marker --------------------------------
+
+CLOSE_SLUGS = ("square-close-when-sold", "square-close-when-withdrawn", "square-close-when-unpublished", "square-close-when-archived")
+
+
+def _workflow(slug):
+    from marvin_integration_square.content import CONTENT
+
+    return next(b for b in CONTENT if b.slug == slug).payload["definition"]
+
+
+@pytest.mark.parametrize("slug", CLOSE_SLUGS)
+def test_close_workflows_hide_the_buy_button_before_calling_square(slug):
+    actions = _workflow(slug)["actions"]
+    assert [(a["kind"], a.get("op") or a.get("task") or a.get("action")) for a in actions] == [
+        ("entry", "set_metadata"),
+        ("handler", "request_site_rebuild"),
+        ("integration", "close_listing"),
+        ("entry", "set_metadata"),
+    ]
+    assert actions[0]["metadata"] == {"checkout_closed": True, "square_listed_for": "closed"}
+    assert actions[2]["args"] == {
+        "payment_link_id": "${entry.metadata.square_payment_link_id}",
+        "variation_id": "${entry.metadata.square_variation_id}",
+    }
+    assert actions[3]["metadata"] == {"square_link_closed": True}
+
+
+@pytest.mark.parametrize("slug", CLOSE_SLUGS)
+def test_close_workflows_key_on_square_link_closed_so_a_retry_still_runs(slug):
+    conditions = _workflow(slug)["conditions"]
+    assert {"field": "entry.metadata.square_link_closed", "op": "neq", "value": True} in conditions
+    # checkout_closed is already true when a retry re-checks the conditions; keying on it would drop the retry.
+    assert not any(c["field"] == "entry.metadata.checkout_closed" for c in conditions)
+
+
+@pytest.mark.parametrize(
+    ("slug", "condition"),
+    [
+        ("square-close-when-unpublished", {"field": "entry.status", "op": "neq", "value": "published"}),
+        ("square-close-when-archived", {"field": "entry.status", "op": "eq", "value": "archived"}),
+    ],
+)
+def test_a_pending_close_retry_is_dropped_once_the_item_is_back(slug, condition):
+    # A republished item gets a new link; a retry of the old close must not then pass and close it.
+    assert condition in _workflow(slug)["conditions"]
+
+
+def test_listing_resets_square_link_closed_so_the_next_sale_closes_the_new_link():
+    marker = next(a for a in _workflow("square-list-for-sale")["actions"] if a.get("op") == "set_metadata")["metadata"]
+    assert (marker["checkout_closed"], marker["square_link_closed"]) == (False, False)
+
+
+def test_mark_sold_ignores_stock_marvin_zeroed_while_closing():
+    definition = _workflow("square-mark-sold")
+    assert definition["target"]["query"]["metadata"] == {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"}
+    assert {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True} in definition["conditions"]
+    assert definition["actions"] == [{"kind": "entry", "op": "set_data", "data": {"status": "sold"}}]

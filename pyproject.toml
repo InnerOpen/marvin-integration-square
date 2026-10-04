@@ -1,11 +1,11 @@
 [project]
 name = "marvin-integration-square"
-version = "0.2.0"
+version = "0.3.0"
 description = "Square integration for Marvin — list one-of-a-kind items in the Square catalog and sell them through a checkout link."
 readme = "README.md"
 requires-python = ">=3.11"
-# 0.3 is the first SDK whose HttpHelper has delete(), which closing a payment link needs.
-dependencies = ["marvin-integration-sdk>=0.3,<1"]
+# 0.5 is the first SDK with error policies (IntegrationError, Handle/Retry, ctx.resume, ctx.idempotency_key).
+dependencies = ["marvin-integration-sdk>=0.5,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11"]
