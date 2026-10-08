@@ -242,6 +242,7 @@ class SquareProvider(IntegrationProvider):
             "message": "{url}{body}",
             "header": "x-square-hmacsha256-signature",
             "notes": "Square: base64 of URL + body",
+            "sender_issues_key": True,  # Square shows each subscription's signature key; Marvin can't make one
         }
     }
 
