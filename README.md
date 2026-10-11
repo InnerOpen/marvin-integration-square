@@ -174,6 +174,18 @@ Webhook signature verification happens in Marvin core. This integration contribu
 `x-square-hmacsha256-signature`) through `signature_schemes`, so it appears in every incoming
 webhook's scheme picker while the integration is installed.
 
+## What it teaches Marvin (0.4.0, SDK 0.9.0)
+
+- **A guide** (`src/marvin_integration_square/guide.md`): connecting sandbox and production, what each action takes
+  and returns, how listing, sold-online / sold-in-person and closing fit together, what it can't do, and what each
+  error code means. Marvin's agents read it when building workflows where Square is connected, and Marvin's manual
+  search finds it.
+- **A recipe** in the Workflow Library, *Re-list every item for sale on Square*: a manual run that makes every
+  published, for-sale item list itself again (a fresh catalog item, stock and checkout link) by resetting
+  `square_listed_for`, for the switch from sandbox to production or after a token or location change. It relies on
+  the *Square: list for sale* workflow being on. Shown as "From the Square plugin 0.4.0", offered once Square is
+  connected.
+
 ## Develop
 
 ```bash
@@ -181,7 +193,7 @@ uv run --extra dev pytest
 uv run --extra dev ruff check .
 ```
 
-The provider depends only on `marvin-integration-sdk` (0.5+, for error policies), not on Marvin core,
+The provider depends only on `marvin-integration-sdk` (0.9+, for the guide and recipes), not on Marvin core,
 so tests run standalone against a stub HTTP client. No test calls Square. `money.py` is pure Python
 and holds the price parsing. The `Square-Version` header is pinned in `provider.py`
 (`SQUARE_VERSION`). Bump it deliberately after reading Square's changelog.

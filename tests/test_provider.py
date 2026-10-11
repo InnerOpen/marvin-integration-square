@@ -6,9 +6,11 @@ from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
 import pytest
-from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError, Response, Retry, resolve_policy
+from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError, Response, Retry, load_guide, resolve_policy
+from marvin_integration_sdk.testing import IntegrationContract
 
 from marvin_integration_square import SquareProvider
+from marvin_integration_square.content import CONTENT
 from marvin_integration_square.provider import (
     CODE_AUTH,
     CODE_CONFIG,
@@ -999,3 +1001,40 @@ def test_mark_sold_ignores_stock_marvin_zeroed_while_closing():
     assert definition["target"]["query"]["metadata"] == {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"}
     assert {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True} in definition["conditions"]
     assert definition["actions"] == [{"kind": "entry", "op": "set_data", "data": {"status": "sold"}}]
+
+
+# ── what Square teaches Marvin (SDK 0.9.0) ───────────────────────────────────
+
+
+class TestSquareContract(IntegrationContract):
+    @pytest.fixture
+    def provider(self):
+        return SquareProvider()
+
+
+def test_the_guide_ships_with_the_package():
+    guide = load_guide(SquareProvider)
+    assert guide.startswith("# Square")
+    # every error code the provider can raise is explained, and the setup names the settings it asks for
+    assert all(f"`{code}`" in guide for code in CODES)
+    assert all(name in guide for name in ("SQUARE_SIGNATURE_KEY", "location_id", "inventory.count.updated", "square_listed_for"))
+
+
+def test_the_reset_recipe_relists_for_sale_items_through_the_list_workflow():
+    (recipe,) = SquareProvider.recipes
+    assert recipe.id == "reset-square-listings" and recipe.definition["trigger"] == {"type": "manual"}
+    query = recipe.definition["target"]["query"]
+    assert (query["entry_type"], query["status"]) == ("{{entry_type}}", "published")
+    assert {"field": "sellOnline", "op": "eq", "value": True} in query["where"]
+    assert {"field": "status", "op": "neq", "value": "sold"} in query["where"]
+    (step,) = recipe.definition["actions"]
+    (marker,) = step["metadata"].items()
+    # the key square-list-for-sale compares against "<price>|<shipping>": a value without the bar never equals it
+    listing = _workflow("square-list-for-sale")
+    assert {"field": "entry.metadata.square_listed_for", "op": "neq", "value": "${entry.data.price}|${entry.data.shippingFee}"} in listing[
+        "conditions"
+    ]
+    assert marker[0] == "square_listed_for" and "|" not in marker[1]
+    # and the item types it targets are the ones the shop-fields blueprint gives a Sell online switch
+    shop_fields = next(b for b in CONTENT if b.slug == "square-shop-fields").payload["fields"]
+    assert "sellOnline" in {f["key"] for f in shop_fields}

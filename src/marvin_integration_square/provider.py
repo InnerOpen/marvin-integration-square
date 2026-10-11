@@ -39,6 +39,7 @@ from marvin_integration_sdk import (
 
 from .content import CONTENT
 from .money import optional_fee_cents, price_cents
+from .recipes import RECIPES
 
 # Latest version in Square's API changelog when this was written (2026-10), and the version the
 # reference examples for every endpoint used here are generated against. Pinned so a Square
@@ -233,6 +234,11 @@ class SquareProvider(IntegrationProvider):
     # What a workspace needs (fields on its item type, the events webhook, three workflows) —
     # declared for review and Apply on the integration's card; see content.py.
     content = CONTENT
+
+    # What Marvin learns about Square (SDK 0.9.0): a how-to its agents read when building workflows here, and a ready-made
+    # workflow in the Workflow Library, offered once Square is connected.
+    guide = "guide.md"
+    recipes = RECIPES
 
     # Square signs `notification URL + body` (base64 HMAC-SHA256). Contributed to Marvin's webhook
     # signature schemes so the declared `square-events` webhook (and any other) can verify it.
