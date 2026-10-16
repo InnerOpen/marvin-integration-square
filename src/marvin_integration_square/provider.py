@@ -230,6 +230,7 @@ class SquareProvider(IntegrationProvider):
     description = "List one-of-a-kind items in your Square catalog (stock of 1) and sell them through a Square checkout link."
     category = CATEGORY_DESTINATION
     icon = "🟩"
+    logo = "logo.svg"  # the Square mark, shown instead of the emoji
 
     # What a workspace needs (fields on its item type, the events webhook, three workflows) —
     # declared for review and Apply on the integration's card; see content.py.
