@@ -16,8 +16,8 @@ RESET_LISTINGS = WorkflowRecipe(
     id="reset-square-listings",
     title="Re-list every item for sale on Square",
     outcome=(
-        "A manual run makes every published item with Sell online on (and not sold) list itself on Square again: a fresh "
-        "catalog item, stock of 1 and checkout link, with the new link stored on the entry."
+        "Run by hand, it lists every published item with Sell online on (and not yet sold) on Square again, with a fresh "
+        "catalog item, a stock of 1 and a new checkout link saved on the entry."
     ),
     category="Square",
     tags=("commerce", "go-live"),
@@ -44,7 +44,7 @@ RESET_LISTINGS = WorkflowRecipe(
         },
     },
     side_effects=(
-        {"kind": "content_mutation", "description": "Writes square_listed_for metadata on every matching entry."},
+        {"kind": "content_mutation", "description": "Marks every matching entry for relisting."},
         {
             "kind": "external_post",
             "description": "The 'Square: list for sale' workflow then creates or refreshes each item's Square listing (it must be switched on).",
