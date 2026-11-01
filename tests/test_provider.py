@@ -197,6 +197,7 @@ def test_create_listing_returns_all_ids_and_checkout_url():
         "checkout_url": "https://square.link/u/abc",
         "order_id": "ORD1",
         "image_id": None,
+        "listed_price": 1170.0,
     }
 
 
@@ -870,6 +871,7 @@ def test_create_listing_resume_that_only_needs_the_old_link_deleted_does_just_th
         "checkout_url": "https://square.link/u/abc",
         "order_id": "ORD1",
         "image_id": None,
+        "listed_price": 1170.0,
     }
 
 
@@ -1000,7 +1002,29 @@ def test_mark_sold_ignores_stock_marvin_zeroed_while_closing():
     definition = _workflow("square-mark-sold")
     assert definition["target"]["query"]["metadata"] == {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"}
     assert {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True} in definition["conditions"]
-    assert definition["actions"] == [{"kind": "entry", "op": "set_data", "data": {"status": "sold"}}]
+    assert definition["actions"][0] == {"kind": "entry", "op": "set_data", "data": {"status": "sold"}}
+
+
+def test_create_listing_returns_the_price_it_listed_at_in_dollars():
+    assert _list(_listing_http(), price="$1,170.50")["listed_price"] == 1170.5
+    assert _list(_listing_http(), price=250)["listed_price"] == 250.0
+
+
+def test_list_for_sale_stores_the_listed_price_on_the_entry():
+    stored = next(a for a in _workflow("square-list-for-sale")["actions"] if a.get("op") == "set_metadata")["metadata"]
+    assert stored["square_listed_price"] == "${steps.listing.output.listed_price}"
+
+
+def test_mark_sold_records_the_sale_as_a_metric_keyed_by_the_item():
+    from marvin_integration_square.content import SALES_METRIC
+
+    sold, recorded = _workflow("square-mark-sold")["actions"]
+    assert sold["op"] == "set_data"
+    # `record`, not `add`: Square can post more than one event per sale, and an item sells once.
+    assert (recorded["kind"], recorded["op"], recorded["metric"]) == ("metric", "record", SALES_METRIC)
+    assert recorded["subject"] == "${entry.slug}" and recorded["value"] == "${entry.metadata.square_listed_price}"
+    # an item listed before the price was stored is still marked sold; only the ledger line is skipped
+    assert recorded["when"] == [{"field": "entry.metadata.square_listed_price", "op": "exists"}]
 
 
 # ── what Square teaches Marvin (SDK 0.9.0) ───────────────────────────────────

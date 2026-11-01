@@ -38,7 +38,7 @@ from marvin_integration_sdk import (
 )
 
 from .content import CONTENT
-from .money import optional_fee_cents, price_cents
+from .money import CENTS_PER_UNIT, optional_fee_cents, price_cents
 from .recipes import RECIPES
 
 # Latest version in Square's API changelog when this was written (2026-10), and the version the
@@ -339,7 +339,15 @@ class SquareProvider(IntegrationProvider):
             },
             output_schema={
                 "type": "object",
-                "properties": {"item_id": _ID, "variation_id": _ID, "payment_link_id": _ID, "checkout_url": _ID, "order_id": _ID, "image_id": _ID},
+                "properties": {
+                    "item_id": _ID,
+                    "variation_id": _ID,
+                    "payment_link_id": _ID,
+                    "checkout_url": _ID,
+                    "order_id": _ID,
+                    "image_id": _ID,
+                    "listed_price": {"type": "number", "description": "The price the item was listed at, in dollars (what a sale of it is worth)."},
+                },
             },
             error_policy=CREATE_LISTING_POLICY,
         ),
@@ -721,6 +729,7 @@ class SquareProvider(IntegrationProvider):
             "checkout_url": progress["checkout_url"],
             "order_id": progress.get("order_id"),
             "image_id": progress.get("image_id"),
+            "listed_price": money["amount"] / CENTS_PER_UNIT,
         }
 
     def _action_close_listing(self, args: dict, ctx: IntegrationContext, progress: dict) -> dict:

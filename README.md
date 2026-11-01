@@ -120,12 +120,19 @@ parameters: `entry_type` (the type whose entries are for sale, default `artwork`
 |---|---|---|
 | fields | `square-shop-fields` | Adds `sellOnline` (boolean), `price` (text) and `shippingFee` (text) to the item type — fields it already has are left alone. |
 | incoming webhook | `square-events` | Square posts here. Signature scheme `square`, key in the workspace secret `SQUARE_SIGNATURE_KEY`. |
-| workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price/shipping that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below → rebuild the site. Covers first listing, switching Sell online on later, and price changes. |
-| workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → the item with that `square_variation_id`, unless its checkout is already closed → status `sold`. Covers a sale through the link *and* a card-reader sale rung up as the catalog item; the 0 that closing a listing sets is not a sale. |
+| workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price/shipping that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below and the listed price → rebuild the site. Covers first listing, switching Sell online on later, and price changes. |
+| workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → the item with that `square_variation_id`, unless its checkout is already closed → status `sold`, and the sale recorded in the `square_sales` metric. Covers a sale through the link *and* a card-reader sale rung up as the catalog item; the 0 that closing a listing sets is not a sale. |
 | workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → close safely (below). Runs once per item. |
 | workflow | `square-close-when-withdrawn` | Sell online switched off → close safely. Switching it back on lists it again. |
 | workflow | `square-close-when-unpublished` | Item unpublished → close safely. Republishing lists it again. |
 | workflow | `square-close-when-archived` | Item archived (e.g. a duplicate retired) → close safely. |
+
+**Sales ledger.** Each sale is one observation in the workspace metric `square_sales`: subject = the
+item's slug, value = the price it was listed at in dollars (`square_listed_price`, stored by the list
+workflow; discounts and shipping are not seen — Square's orders and payments are never read), window =
+the day it sold. A `record`, not an `add`, so Square's repeat events for one sale can't count twice.
+Read it in Settings → Automation → Metrics, with `GET /api/groups/metrics/observations?metric=square_sales`,
+or with a `metric` step (`op: read`) in a workflow of your own: `count` is sales, `total` is revenue.
 
 **Closing safely.** Each close workflow runs four steps, in this order:
 
@@ -168,6 +175,10 @@ Metadata the workflows keep on each item:
 integration's card: click **Update** on each to get the new close order. Items closed under 0.2 have
 no `square_link_closed`, so the next edit of a sold or withdrawn one runs its close once more; that is
 harmless (the link is already gone, and the stock goes to 0).
+
+**Upgrading to 0.6.** `square-list-for-sale` and `square-mark-sold` show as out of date: click **Update** on
+each. Items listed before the update carry no `square_listed_price`, so a sale of one is marked sold but not
+recorded; *Re-list every item for sale on Square* (Workflow Library) stores it on every listed item.
 
 Webhook signature verification happens in Marvin core. This integration contributes the
 `square` signature scheme (base64 HMAC-SHA256 over the notification URL + body, header

@@ -65,9 +65,12 @@ provider-neutral: the Buy button reads `checkout_url` and `checkout_closed` in t
    turning Sell online on later, and a price or shipping change.
 2. **Sold, online or in person.** Square posts `inventory.count.updated` to the `square-events` incoming webhook. When
    the count for an item's variation is `IN_STOCK` with quantity `0` and the item's checkout isn't already closed, the
-   *Square: mark sold* workflow sets its `status` to `sold`. This covers a purchase through the link and a card-reader
-   sale rung up as the catalog item. The zero that closing a listing sets is not a sale. Square can send more than one
-   event for one sale; only one matches.
+   *Square: mark sold* workflow sets its `status` to `sold` and records the sale in the `square_sales` metric (subject
+   the item's slug, value the price it was listed at — `square_listed_price`, which the list workflow stores — window
+   the day it sold; a `record`, so a repeat event can't count twice). This covers a purchase through the link and a
+   card-reader sale rung up as the catalog item. The zero that closing a listing sets is not a sale. Square can send
+   more than one event for one sale; only one matches. Read the ledger in Settings → Automation → Metrics or with a
+   `metric` step (`op: read`, metric `square_sales`): `count` is sales, `total` is revenue.
 3. **Closing.** A separate workflow closes the link when an item becomes `sold` (by a sale or by hand), when Sell online
    is switched off, when it is unpublished, and when it is archived. Each one first marks `checkout_closed: true` and
    rebuilds the site (the Buy button goes whatever Square does next), then runs `close_listing`, then marks

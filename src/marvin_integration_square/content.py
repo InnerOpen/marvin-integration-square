@@ -44,6 +44,7 @@ INTEGRATION_PARAM = {
 }
 
 WEBHOOK_SLUG = "square-events"
+SALES_METRIC = "square_sales"  # one observation per sold item: subject = slug, value = listed price, window = day sold
 
 SHOP_FIELDS = ContentBlueprint(
     kind="entry_fields",
@@ -135,6 +136,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "checkout_closed": False,
                         "square_link_closed": False,
                         "square_listed_for": "${entry.data.price}|${entry.data.shippingFee}",
+                        "square_listed_price": "${steps.listing.output.listed_price}",
                     },
                 },
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square listing"}},
@@ -148,7 +150,8 @@ MARK_SOLD = ContentBlueprint(
     slug="square-mark-sold",
     name="Square: mark sold",
     description=(
-        "When Square reports an item's stock reached 0 — sold online or on a card reader — set its status to sold. "
+        "When Square reports an item's stock reached 0 — sold online or on a card reader — set its status to sold and "
+        "record the sale (the price it was listed at) in the square_sales metric. "
         "Stock that Marvin zeroed itself while closing the listing is not a sale."
     ),
     required=True,
@@ -173,7 +176,20 @@ MARK_SOLD = ContentBlueprint(
                 {"field": "event.payload.data.object.inventory_counts.0.quantity", "op": "eq", "value": "0"},
                 {"field": "entry.metadata.checkout_closed", "op": "neq", "value": True},
             ],
-            "actions": [{"kind": "entry", "op": "set_data", "data": {"status": "sold"}}],
+            "actions": [
+                {"kind": "entry", "op": "set_data", "data": {"status": "sold"}},
+                # The sales ledger: one observation per item (its slug), worth the price it was listed at, in the day
+                # it sold. `record` replaces rather than adds, so a second event for the same sale can't count twice.
+                # An item listed before 0.6 has no listed price on it: its sale is marked, not recorded.
+                {
+                    "kind": "metric",
+                    "op": "record",
+                    "metric": SALES_METRIC,
+                    "subject": "${entry.slug}",
+                    "value": "${entry.metadata.square_listed_price}",
+                    "when": [{"field": "entry.metadata.square_listed_price", "op": "exists"}],
+                },
+            ],
         }
     },
 )
