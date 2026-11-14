@@ -10,7 +10,7 @@ from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError,
 from marvin_integration_sdk.testing import IntegrationContract
 
 from marvin_integration_square import SquareProvider
-from marvin_integration_square.content import CONTENT, LISTED_FOR, NO_PICKUP_LINK, PICKUP_ON
+from marvin_integration_square.content import CONTENT, LISTED_FOR, NO_PICKUP_LINK, PASS, PICKUP_ON, RELIST_BATCH_SIZE
 from marvin_integration_square.provider import (
     CODE_AUTH,
     CODE_CONFIG,
@@ -413,8 +413,10 @@ def test_provider_declares_fields_webhook_and_workflows():
         ("workflow", "square-close-when-withdrawn"),
         ("workflow", "square-close-when-unpublished"),
         ("workflow", "square-close-when-archived"),
+        ("workflow", "square-relist-paced"),
     ]
-    assert all(c["required"] for c in content)
+    # the paced re-list is a tool to run when needed, not part of the selling loop
+    assert [c["slug"] for c in content if not c["required"]] == ["square-relist-paced"]
 
 
 def test_declared_workflows_only_call_actions_the_provider_has():
@@ -1073,22 +1075,127 @@ def test_the_guide_ships_with_the_package():
     assert all(name in guide for name in ("SQUARE_SIGNATURE_KEY", "location_id", "inventory.count.updated", "square_listed_for"))
 
 
-def test_the_reset_recipe_relists_for_sale_items_through_the_list_workflow():
-    (recipe,) = SquareProvider.recipes
-    assert recipe.id == "reset-square-listings" and recipe.definition["trigger"] == {"type": "manual"}
-    query = recipe.definition["target"]["query"]
+def test_the_one_shot_relist_recipe_is_gone():
+    # It reset every item in one run and held the backend's connections for minutes; square-relist-paced replaces it.
+    assert SquareProvider.recipes == ()
+
+
+# ── re-listing everything, a few a minute ─────────────────────────────────────
+
+
+def _paced():
+    return _workflow("square-relist-paced")
+
+
+def test_the_paced_relist_runs_every_minute_and_is_off_until_switched_on():
+    blueprint = next(b for b in CONTENT if b.slug == "square-relist-paced")
+    assert _paced()["trigger"] == {"type": "schedule", "schedule_type": "interval", "schedule_config": {"interval_seconds": 60}}
+    assert "Switch it on" in blueprint.description and "switch it off" in blueprint.description
+    assert blueprint.required is False  # Apply creates it switched off, like every declared workflow
+
+
+def test_the_paced_relist_batch_size_is_a_parameter_defaulting_to_five():
+    blueprint = next(b for b in CONTENT if b.slug == "square-relist-paced")
+    (param,) = [p for p in blueprint.parameters if p["key"] == "batch_size"]
+    assert (param["default"], RELIST_BATCH_SIZE) == ("5", 5)
+    batch = _paced()["actions"][0]
+    assert (batch["kind"], batch["id"], batch["limit"]) == ("collect", "batch", "{{batch_size}}")
+
+
+def test_the_paced_relist_picks_items_for_sale_with_a_price_not_done_in_this_pass():
+    query = _paced()["actions"][0]["query"]
     assert (query["entry_type"], query["status"]) == ("{{entry_type}}", "published")
-    assert {"field": "sellOnline", "op": "eq", "value": True} in query["where"]
-    assert {"field": "status", "op": "neq", "value": "sold"} in query["where"]
-    (step,) = recipe.definition["actions"]
-    (marker,) = step["metadata"].items()
-    # the key square-list-for-sale compares against "<price>|<shipping>": a value without the bar never equals it
-    listing = _workflow("square-list-for-sale")
-    assert {"field": "entry.metadata.square_listed_for", "op": "neq", "value": LISTED_FOR} in listing["conditions"]
-    assert marker[0] == "square_listed_for" and "|" not in marker[1]
-    # and the item types it targets are the ones the shop-fields blueprint gives a Sell online switch
-    shop_fields = next(b for b in CONTENT if b.slug == "square-shop-fields").payload["fields"]
-    assert "sellOnline" in {f["key"] for f in shop_fields}
+    assert query["where"] == [
+        {"field": "sellOnline", "op": "eq", "value": True},
+        {"field": "status", "op": "neq", "value": "sold"},
+        {"field": "price", "op": "exists"},
+        {"field": "metadata.square_relist_pass", "op": "neq", "value": PASS},
+    ]
+    assert PASS == '${vars.SQUARE_RELIST_PASS|default:"1"}'
+
+
+def test_the_paced_relist_resets_the_listing_and_marks_the_pass_in_one_write():
+    relist = _paced()["actions"][1]
+    assert (relist["kind"], relist["for_each"], relist["as"]) == ("repeat", "${steps.batch.output.rows}", "piece")
+    (write,) = relist["steps"]
+    assert (write["op"], write["entity_id"]) == ("set_metadata", "${piece.id}")
+    assert write["metadata"] == {"square_listed_for": "reset", "square_relist_pass": PASS}
+    # "reset" has no bar, so it never equals what the list workflow compares against: the item lists again
+    assert "|" not in write["metadata"]["square_listed_for"] and LISTED_FOR.count("|") >= 2
+
+
+def test_the_paced_relist_reports_once_when_nothing_is_left():
+    done = _paced()["actions"][2:]
+    assert all(step["when"] == [{"field": "steps.batch.output.count", "op": "eq", "value": 0}] for step in done)
+    alert = done[-1]
+    assert alert["kind"] == "alert" and alert["idempotency_key"] == f"square-relist-done-{PASS}"
+    assert alert["idempotency_window_hours"] == 720  # one alert per pass, not one a minute
+    unlisted = next(step for step in done if step.get("id") == "unlisted")["query"]["where"]
+    assert {"field": "metadata.square_listed_for", "op": "eq", "value": "reset"} in unlisted
+
+
+# A stand-in for Marvin's engine, enough to follow a pass minute by minute: the collect (its where list over plain dicts,
+# the pass resolved as the default "1"), the repeat's one write, and what the list workflow then does to each item.
+def _where_holds(item: dict, where: list[dict]) -> bool:
+    def value(field):
+        return item["metadata"].get(field[len("metadata.") :]) if field.startswith("metadata.") else item["data"].get(field)
+
+    tests = {
+        "eq": lambda v, want: v == want,
+        "neq": lambda v, want: v != want,
+        "exists": lambda v, _w: v not in (None, ""),
+        "missing": lambda v, _w: v in (None, ""),
+    }
+    return all(tests[w["op"]](value(w["field"]), "1" if w.get("value") == PASS else w.get("value")) for w in where)
+
+
+def _minute(items: list[dict], *, batch_size: int, lists=lambda item: True) -> list[str]:
+    """One scheduled run: the slugs it re-lists. `lists(item)` is whether the list workflow then lists it."""
+    actions = _paced()["actions"]
+    picked = [i for i in items if i["published"] and _where_holds(i, actions[0]["query"]["where"])][:batch_size]
+    (write,) = actions[1]["steps"]
+    for item in picked:
+        item["metadata"].update({k: "1" if v == PASS else v for k, v in write["metadata"].items()})
+        if lists(item):
+            item["metadata"]["square_listed_for"] = "$1|10|true"
+    return [i["slug"] for i in picked]
+
+
+def _shop(n: int) -> list[dict]:
+    items = [
+        {"slug": f"piece-{k}", "published": True, "data": {"sellOnline": True, "status": "available", "price": "$100"}, "metadata": {}}
+        for k in range(n)
+    ]
+    items.append({"slug": "no-price", "published": True, "data": {"sellOnline": True, "status": "available"}, "metadata": {}})
+    items.append({"slug": "sold", "published": True, "data": {"sellOnline": True, "status": "sold", "price": "$1"}, "metadata": {}})
+    return items
+
+
+def test_a_pass_honours_the_batch_size_and_never_picks_an_item_twice():
+    shop = _shop(12)
+    minutes = [_minute(shop, batch_size=5) for _ in range(4)]
+    assert [len(m) for m in minutes] == [5, 5, 2, 0]  # then it stops: nothing left
+    picked = [slug for m in minutes for slug in m]
+    assert len(picked) == len(set(picked)) == 12
+    assert "no-price" not in picked and "sold" not in picked
+
+
+def test_switching_it_off_and_on_carries_on_without_relisting():
+    shop = _shop(7)
+    first = _minute(shop, batch_size=5)
+    # off for a while (no runs), then on again
+    second = _minute(shop, batch_size=5)
+    assert len(first) == 5 and len(second) == 2 and not set(first) & set(second)
+
+
+def test_an_item_whose_listing_fails_is_not_picked_again_and_is_reported():
+    shop = _shop(3)
+    _minute(shop, batch_size=5, lists=lambda item: item["slug"] != "piece-1")
+    assert _minute(shop, batch_size=5) == []  # not retried every minute
+    unlisted = next(step for step in _paced()["actions"] if step.get("id") == "unlisted")["query"]["where"]
+    assert [i["slug"] for i in shop if _where_holds(i, unlisted)] == ["piece-1"]
+    no_price = next(step for step in _paced()["actions"] if step.get("id") == "no_price")["query"]["where"]
+    assert [i["slug"] for i in shop if _where_holds(i, no_price)] == ["no-price"]
 
 
 # ── studio pickup: a second link with no shipping fee ────────────────────────

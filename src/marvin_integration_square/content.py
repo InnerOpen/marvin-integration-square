@@ -1,8 +1,9 @@
 """What a workspace needs for Square selling, declared for the core to offer — never created here.
 
 Applying (from the integration's card) creates only what is missing: the shop fields on the
-workspace's own item type, the incoming webhook Square posts to, and six workflows. Webhooks and
-workflows arrive switched off; turning them on after a review is the deliberate last step.
+workspace's own item type, the incoming webhook Square posts to, six workflows, and an optional seventh
+that re-lists everything a few items a minute. Webhooks and workflows arrive switched off; turning them on
+after a review is the deliberate last step.
 
 The loop:
   a published item with "Sell online" on (or a new price/shipping) → `create_listing` → ids + checkout URL stored on the entry
@@ -49,8 +50,8 @@ SALES_METRIC = "square_sales"  # one observation per sold item: subject = slug, 
 
 # What an item was listed for: price, shipping fee and whether it offers studio pickup. The list workflow runs while the
 # stored `square_listed_for` differs, so a change to any of them lists the item again. A missing pickupAvailable (every
-# item from before the switch existed) reads as on, the same as the provider treats it; `lower` makes a stored "true" and
-# True the same text, so a save that only makes the default explicit doesn't re-list.
+# item from before the switch existed) reads as on, and is passed to the provider as "true"; `lower` makes a stored "true"
+# and True the same text, so a save that only makes the default explicit doesn't re-list.
 PICKUP_ON = '${entry.data.pickupAvailable|default:"true"|lower}'
 LISTED_FOR = f"${{entry.data.price}}|${{entry.data.shippingFee}}|{PICKUP_ON}"
 
@@ -319,6 +320,122 @@ CLOSE_WHEN_ARCHIVED = _close_when(
     "square listing archived",
 )
 
+# ---- re-listing everything, a few at a time --------------------------------------------------------------------------
+#
+# Re-listing every item at once (one manual run over ~110 items, each reset firing the list workflow, each listing several
+# Square calls) held the backend's database connections for minutes. This workflow does it in small batches instead: a
+# schedule runs it every minute, each run resets `square_listed_for` on the next few items (the list workflow then lists
+# each one) and marks them done for this pass, so a run never picks an item twice and an item whose listing fails is not
+# picked again. Switching it off pauses the pass; switching it on carries on where it stopped.
+LISTED_FOR_KEY = "square_listed_for"
+RESET_VALUE = "reset"  # has no "|", so it never equals a LISTED_FOR value: the list workflow lists the item again
+PASS_KEY = "square_relist_pass"
+# Which pass this is: the workspace Variable SQUARE_RELIST_PASS, else "1". A later pass (a new token, a new location)
+# needs a new name there, e.g. the date; until then every item already carries this pass and there is nothing to do.
+PASS = '${vars.SQUARE_RELIST_PASS|default:"1"}'
+RELIST_BATCH_SIZE = 5  # items per minute; the repeat step that resets them takes at most 25
+RELIST_EVERY_SECONDS = 60
+BATCH_SIZE_PARAM = {
+    "key": "batch_size",
+    "label": "How many items to re-list each minute",
+    "kind": "text",
+    "default": str(RELIST_BATCH_SIZE),
+    "help": "A few at a time keeps Marvin responsive while Square is called; at most 25.",
+}
+FOR_SALE = [{"field": "sellOnline", "op": "eq", "value": True}, {"field": "status", "op": "neq", "value": "sold"}]
+IN_PASS = {"field": f"metadata.{PASS_KEY}", "op": "eq", "value": PASS}
+
+
+def _for_sale(*where: dict) -> dict:
+    return {"entry_type": "{{entry_type}}", "status": "published", "where": [*FOR_SALE, *where]}
+
+
+def _when_done(step: dict) -> dict:
+    return {**step, "when": [{"field": "steps.batch.output.count", "op": "eq", "value": 0}]}
+
+
+RELIST_PACED = ContentBlueprint(
+    kind="workflow",
+    slug="square-relist-paced",
+    name="Square: re-list every item, a few a minute",
+    description=(
+        "Switch it on to re-list every published item that is for sale online on Square, a few each minute: a fresh listing "
+        "with new checkout links (and a studio-pickup link where it is offered), on the same catalog item. Use it after "
+        "switching from sandbox to production, after a token or location change, or to give items listed before 0.7 their "
+        "pickup link. Needs 'Square: list for sale' switched on. When every item is done it sends one alert saying how many "
+        "were re-listed and which were not; then switch it off. Switching it off pauses it, and switching it on again carries "
+        "on without re-listing an item twice. For another pass later, set the workspace Variable SQUARE_RELIST_PASS to a new "
+        "name (the date, say) first."
+    ),
+    required=False,
+    category=CATEGORY,
+    parameters=(ENTRY_TYPE_PARAM, BATCH_SIZE_PARAM),
+    payload={
+        "definition": {
+            "trigger": {"type": "schedule", "schedule_type": "interval", "schedule_config": {"interval_seconds": RELIST_EVERY_SECONDS}},
+            "actions": [
+                # The next few items for sale, with a price, not yet done in this pass.
+                {
+                    "kind": "collect",
+                    "id": "batch",
+                    "entity": "entry",
+                    "query": _for_sale({"field": "price", "op": "exists"}, {"field": f"metadata.{PASS_KEY}", "op": "neq", "value": PASS}),
+                    "limit": "{{batch_size}}",
+                },
+                # Reset and mark done in one write: an item is never picked again in this pass, whether its listing then
+                # works or not (a failed one is named in the alert, not retried every minute).
+                {
+                    "kind": "repeat",
+                    "id": "relist",
+                    "for_each": "${steps.batch.output.rows}",
+                    "as": "piece",
+                    "steps": [
+                        {
+                            "kind": "entry",
+                            "op": "set_metadata",
+                            "entity_id": "${piece.id}",
+                            "metadata": {LISTED_FOR_KEY: RESET_VALUE, PASS_KEY: PASS},
+                        }
+                    ],
+                },
+                # Nothing left: say how the pass went, once.
+                _when_done({"kind": "collect", "id": "relisted", "entity": "entry", "query": _for_sale(IN_PASS), "limit": 25}),
+                _when_done(
+                    {
+                        "kind": "collect",
+                        "id": "unlisted",
+                        "entity": "entry",
+                        # Still "reset" a minute after its turn: the list workflow didn't list it (it failed, or is off).
+                        "query": _for_sale(IN_PASS, {"field": f"metadata.{LISTED_FOR_KEY}", "op": "eq", "value": RESET_VALUE}),
+                        "limit": 25,
+                    }
+                ),
+                _when_done(
+                    {"kind": "collect", "id": "no_price", "entity": "entry", "query": _for_sale({"field": "price", "op": "missing"}), "limit": 25}
+                ),
+                _when_done(
+                    {
+                        "kind": "alert",
+                        "level": "info",
+                        "title": "Square re-listing is done",
+                        "message": (
+                            f"Pass {PASS}: ${{steps.relisted.output.total}} items re-listed. "
+                            "${steps.unlisted.output.total} not listed yet (the listing failed, waits for a retry, or 'Square: list for sale' is off), "
+                            "${steps.no_price.output.total} skipped for having no price. You can switch this workflow off."
+                        ),
+                        "details": (
+                            'Not listed:\n${steps.unlisted.output.text|default:"none"}\n\nNo price:\n${steps.no_price.output.text|default:"none"}'
+                        ),
+                        "idempotency_key": f"square-relist-done-{PASS}",
+                        "idempotency_window_hours": 720,
+                    }
+                ),
+            ],
+        }
+    },
+)
+
+
 CONTENT = (
     SHOP_FIELDS,
     EVENTS_WEBHOOK,
@@ -328,4 +445,5 @@ CONTENT = (
     CLOSE_WHEN_WITHDRAWN,
     CLOSE_WHEN_UNPUBLISHED,
     CLOSE_WHEN_ARCHIVED,
+    RELIST_PACED,
 )
