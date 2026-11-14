@@ -62,7 +62,7 @@ SHIPPING_FEE_NAME = "Shipping"
 PICKUP_NOTE = "Studio pickup. We'll email you to arrange a time."
 PICKUP_PAYMENT_NOTE = "{slug} (studio pickup)"
 PICKUP_SCHEDULE = "ASAP"
-OFF_WORDS = frozenset({"false", "0", "no", "off"})
+ON_WORDS = frozenset({"true", "1", "yes", "on"})
 SLUG_PLACEHOLDER = "{slug}"
 HTTP_NOT_FOUND = 404
 HTTP_SERVER_ERROR = 500
@@ -170,10 +170,11 @@ def _now_rfc3339() -> str:
 
 
 def _is_on(value) -> bool:
-    """A yes/no argument where nothing (a field the item doesn't have yet) means yes."""
-    if value is None or isinstance(value, bool):
-        return value is not False
-    return str(value).strip().lower() not in OFF_WORDS
+    """A yes/no argument. Left out means no: a workflow from before 0.7 (not yet Updated) never stores a pickup link, so it
+    must not get one it couldn't close. The 0.7 workflow passes the item's switch with its default already applied."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ON_WORDS
 
 
 def _fingerprint(*parts) -> str:
@@ -349,8 +350,8 @@ class SquareProvider(IntegrationProvider):
                     "payment_link_id": {**_ID, "description": "Existing payment link to replace."},
                     "pickup": {
                         "type": ["boolean", "string", "null"],
-                        "description": "Also make a studio-pickup link (same price, no shipping fee). Left out or blank means yes; "
-                        "it is only made when there is a shipping fee to leave off.",
+                        "description": "Also make a studio-pickup link (same price, no shipping fee): true, or 'true'/'yes'/'1'/'on'. "
+                        "Left out means no. It is only made when there is a shipping fee to leave off.",
                     },
                     "pickup_payment_link_id": {**_ID, "description": "Existing studio-pickup link to replace (or delete, when pickup is off)."},
                     "image_url": {

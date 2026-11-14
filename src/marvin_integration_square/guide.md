@@ -36,9 +36,9 @@ find the `location_id`.
 - `description` (optional) goes on the catalog item. `image_url` (optional) is a public URL of the item's picture
   (JPEG, PNG or GIF up to 15 MB); it is uploaded so the checkout shows it, skipped if the item already has a picture,
   and a picture that can't be fetched never stops the listing.
-- `pickup` (optional, default yes: left out, blank or null mean yes; `false`, `"0"`, `"no"`, `"off"` mean no) also makes a
-  studio-pickup link: same variation and price, no shipping fee, no shipping address, a `PICKUP` fulfillment with the
-  note "Studio pickup. We'll email you to arrange a time." Only when there is a shipping fee (without one the main link
+- `pickup` (optional: `true`, or `"true"`, `"yes"`, `"1"`, `"on"`; left out means no) also makes a studio-pickup link:
+  same variation and price, no shipping fee, no shipping address, a `PICKUP` fulfillment with the note "Studio pickup.
+  We'll email you to arrange a time." Only when there is a shipping fee (without one the main link
   has no shipping already). It is made before the main link; if Square refuses it (`invalid`) the item is still listed,
   with shipping only, and `pickup_error` says why. `pickup_payment_link_id` is the earlier pickup link, replaced on a
   re-list or deleted when pickup is now off.
@@ -70,7 +70,7 @@ metadata. The item type gets an **Offer studio pickup** switch (`pickupAvailable
 1. **Listing.** The *Square: list for sale* workflow runs on any update of a published item with **Sell online** on, a
    price, and a status other than `sold`, whose price, shipping fee or studio pickup differs from what it was last
    listed at (`square_listed_for`, stored as `price|shipping|pickup`, an unset pickup read as `true`). It calls
-   `create_listing` with the ids already on the entry and `pickup` from `pickupAvailable`, stores `square_item_id`,
+   `create_listing` with the ids already on the entry and `pickup` from `pickupAvailable` (unset passed as `true`), stores `square_item_id`,
    `square_variation_id`, `square_payment_link_id`, `square_order_id`, `checkout_url`, `pickup_checkout_url`,
    `square_pickup_payment_link_id` and `square_pickup_order_id` (the pickup ones `false` when there is no pickup link,
    because a workflow can't store an empty value) with `checkout_provider: square`, `checkout_closed: false`, and

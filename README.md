@@ -63,9 +63,9 @@ creates the new link, and only then deletes the old one (a link that is already 
 item is never left without a way to buy it. The checkout URL changes, so store the new one. If the
 stored variation no longer exists in Square, a new item is created.
 
-**Studio pickup.** `pickup` (default on: left out, blank or null all mean yes; `false`, `"false"`,
-`"0"`, `"no"`, `"off"` mean no) asks for a second link the buyer uses to collect the piece: the same
-catalog variation and price, no `shipping_fee`, no shipping address (asking for one makes Square give
+**Studio pickup.** `pickup` (`true`, or `"true"`, `"yes"`, `"1"`, `"on"`; left out or anything else
+means no, so a workflow from before 0.7 that stores no pickup link never gets one) asks for a second
+link the buyer uses to collect the piece: the same catalog variation and price, no `shipping_fee`, no shipping address (asking for one makes Square give
 the order a `SHIPMENT` fulfillment), and a `PICKUP` fulfillment (`schedule_type: ASAP`, the note above;
 no recipient, since the buyer isn't known yet: Square's checkout asks for their email and phone). Its
 `payment_note` is `<slug> (studio pickup)`. It is made only when there is a shipping fee to leave off;
@@ -203,7 +203,8 @@ recorded; *Re-list every item for sale on Square* (Workflow Library) stores it o
 
 **Upgrading to 0.7 (studio pickup).** Apply on the card adds the `pickupAvailable` field (fields the type
 already has are left alone). Then click **Update** on the four close workflows **first**, so a sale through
-a pickup link closes both links, and only then on `square-list-for-sale`. The stored `square_listed_for` of
+a pickup link closes both links, and only then on `square-list-for-sale`. Until list-for-sale is Updated it passes no
+`pickup`, so it makes no pickup links (none it couldn't store or close). The stored `square_listed_for` of
 every item listed before 0.7 is `price|shipping`, which the new `price|shipping|pickup` never equals: each one
 lists again on its next edit, or all at once with *Re-list every item for sale on Square*. That re-list keeps
 the catalog item and replaces the shipped link with a new one (a new URL; the site reads it from the entry)

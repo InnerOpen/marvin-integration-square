@@ -51,7 +51,8 @@ SALES_METRIC = "square_sales"  # one observation per sold item: subject = slug, 
 # stored `square_listed_for` differs, so a change to any of them lists the item again. A missing pickupAvailable (every
 # item from before the switch existed) reads as on, the same as the provider treats it; `lower` makes a stored "true" and
 # True the same text, so a save that only makes the default explicit doesn't re-list.
-LISTED_FOR = '${entry.data.price}|${entry.data.shippingFee}|${entry.data.pickupAvailable|default:"true"|lower}'
+PICKUP_ON = '${entry.data.pickupAvailable|default:"true"|lower}'
+LISTED_FOR = f"${{entry.data.price}}|${{entry.data.shippingFee}}|{PICKUP_ON}"
 
 SHOP_FIELDS = ContentBlueprint(
     kind="entry_fields",
@@ -139,7 +140,8 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "description": "${entry.summary}",
                         "variation_id": "${entry.metadata.square_variation_id}",
                         "payment_link_id": "${entry.metadata.square_payment_link_id}",
-                        "pickup": "${entry.data.pickupAvailable}",
+                        # The same "true"/"false" the marker holds, so the listing and the marker can't disagree.
+                        "pickup": PICKUP_ON,
                         "pickup_payment_link_id": "${entry.metadata.square_pickup_payment_link_id}",
                         "image_url": "${entry.image}",
                     },
