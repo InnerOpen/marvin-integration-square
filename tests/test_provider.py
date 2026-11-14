@@ -10,7 +10,7 @@ from marvin_integration_sdk import Handle, IntegrationContext, IntegrationError,
 from marvin_integration_sdk.testing import IntegrationContract
 
 from marvin_integration_square import SquareProvider
-from marvin_integration_square.content import CONTENT
+from marvin_integration_square.content import CONTENT, LISTED_FOR, NO_PICKUP_LINK
 from marvin_integration_square.provider import (
     CODE_AUTH,
     CODE_CONFIG,
@@ -21,6 +21,7 @@ from marvin_integration_square.provider import (
     CODE_UNAVAILABLE,
     CODE_UNKNOWN,
     CODES,
+    PICKUP_NOTE,
     SQUARE_VERSION,
     SquareError,
 )
@@ -74,6 +75,16 @@ INVENTORY = {"counts": [{"catalog_object_id": "VAR1", "state": "IN_STOCK", "loca
 LINK = {
     "payment_link": {"id": "PL1", "version": 1, "url": "https://square.link/u/abc", "long_url": "https://checkout.square.site/x", "order_id": "ORD1"}
 }
+PICKUP_LINK = {
+    "payment_link": {
+        "id": "PU1",
+        "version": 1,
+        "url": "https://square.link/u/pickup",
+        "long_url": "https://checkout.square.site/p",
+        "order_id": "ORDP",
+    }
+}
+NO_PICKUP = {"pickup_payment_link_id": None, "pickup_checkout_url": None, "pickup_order_id": None, "pickup_error": None}
 SQUARE_400 = {"errors": [{"category": "INVALID_REQUEST_ERROR", "code": "INVALID_VALUE", "detail": "Invalid currency 'XYZ'.", "field": "price_money"}]}
 
 
@@ -88,6 +99,8 @@ class _StubHttp:
         self.calls.append({"method": method, "url": url, "json": body, "headers": headers, "data": data})
         for route_method, needle, status, payload, *response_headers in self.routes:
             if route_method == method and needle in url:
+                if callable(payload):  # answers by what was asked, e.g. the pickup link apart from the shipped one
+                    status, payload = payload(body)
                 content = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
                 return Response(status_code=status, content=content, headers=response_headers[0] if response_headers else {})
         return Response(status_code=599, content=b'{"errors":[{"detail":"no stub route"}]}')
@@ -119,9 +132,21 @@ def _listing_http(upsert=NEW_ITEM, delete_status=200, upsert_status=200, retriev
             ("POST", "/v2/catalog/object", upsert_status, upsert if upsert_status == 200 else SQUARE_400),
             ("POST", "/v2/inventory/changes/batch-create", 200, INVENTORY),
             ("DELETE", "/v2/online-checkout/payment-links/", delete_status, {"id": "OLD", "cancelled_order_id": "ORD0"}),
-            ("POST", "/v2/online-checkout/payment-links", 200, LINK),
+            ("POST", "/v2/online-checkout/payment-links", 200, _link_or_pickup_link),
         ]
     )
+
+
+def _is_pickup(body) -> bool:
+    return bool((body or {}).get("order", {}).get("fulfillments"))
+
+
+def _link_or_pickup_link(body):
+    return 200, PICKUP_LINK if _is_pickup(body) else LINK
+
+
+def _link_bodies(http, *, pickup: bool) -> list[dict]:
+    return [c["json"] for c in http.calls if c["method"] == "POST" and c["url"].endswith("/payment-links") and _is_pickup(c["json"]) == pickup]
 
 
 def _ctx(http=None, secret="tok", resume=None, seed=None, **config):
@@ -198,6 +223,7 @@ def test_create_listing_returns_all_ids_and_checkout_url():
         "order_id": "ORD1",
         "image_id": None,
         "listed_price": 1170.0,
+        **NO_PICKUP,
     }
 
 
@@ -212,7 +238,8 @@ def test_create_listing_idempotency_keys_are_unique_per_call():
 def test_create_listing_with_shipping_fee_adds_it_to_checkout_options():
     http = _listing_http()
     _list(http, shipping_fee="$45")
-    fee = http.body("POST", "/online-checkout/payment-links")["checkout_options"]["shipping_fee"]
+    (shipped,) = _link_bodies(http, pickup=False)
+    fee = shipped["checkout_options"]["shipping_fee"]
     assert fee == {"name": "Shipping", "charge": {"amount": 4500, "currency": "USD"}}
 
 
@@ -313,7 +340,7 @@ def test_every_call_sends_auth_and_version_headers():
 def test_close_listing_deletes_link(status, already):
     http = _listing_http(delete_status=status)
     out = SquareProvider().run_action("close_listing", {"payment_link_id": "PL1"}, _ctx(http))
-    assert out == {"closed": True, "already": already, "stock_zeroed": False}
+    assert out == {"closed": True, "already": already, "stock_zeroed": False, "pickup_closed": False}
     assert http.paths() == [("DELETE", "/v2/online-checkout/payment-links/PL1")]
 
 
@@ -787,7 +814,7 @@ def test_close_listing_zeroes_stock_before_deleting_the_link():
         LOCATION,
         "0",
     )
-    assert out == {"closed": True, "already": False, "stock_zeroed": True}
+    assert out == {"closed": True, "already": False, "stock_zeroed": True, "pickup_closed": False}
 
 
 def test_close_listing_link_failure_after_zeroing_keeps_the_progress():
@@ -810,7 +837,7 @@ def test_close_listing_ignores_progress_saved_for_another_link():
 
 def test_close_listing_link_already_gone_after_zeroing_is_success():
     out = _close(_listing_http(delete_status=404))
-    assert out == {"closed": True, "already": True, "stock_zeroed": True}
+    assert out == {"closed": True, "already": True, "stock_zeroed": True, "pickup_closed": False}
 
 
 def test_close_listing_with_the_variation_gone_still_deletes_the_link():
@@ -872,6 +899,7 @@ def test_create_listing_resume_that_only_needs_the_old_link_deleted_does_just_th
         "order_id": "ORD1",
         "image_id": None,
         "listed_price": 1170.0,
+        **NO_PICKUP,
     }
 
 
@@ -968,6 +996,7 @@ def test_close_workflows_hide_the_buy_button_before_calling_square(slug):
     assert actions[0]["metadata"] == {"checkout_closed": True, "square_listed_for": "closed"}
     assert actions[2]["args"] == {
         "payment_link_id": "${entry.metadata.square_payment_link_id}",
+        "pickup_payment_link_id": "${entry.metadata.square_pickup_payment_link_id}",
         "variation_id": "${entry.metadata.square_variation_id}",
     }
     assert actions[3]["metadata"] == {"square_link_closed": True}
@@ -1055,10 +1084,263 @@ def test_the_reset_recipe_relists_for_sale_items_through_the_list_workflow():
     (marker,) = step["metadata"].items()
     # the key square-list-for-sale compares against "<price>|<shipping>": a value without the bar never equals it
     listing = _workflow("square-list-for-sale")
-    assert {"field": "entry.metadata.square_listed_for", "op": "neq", "value": "${entry.data.price}|${entry.data.shippingFee}"} in listing[
-        "conditions"
-    ]
+    assert {"field": "entry.metadata.square_listed_for", "op": "neq", "value": LISTED_FOR} in listing["conditions"]
     assert marker[0] == "square_listed_for" and "|" not in marker[1]
     # and the item types it targets are the ones the shop-fields blueprint gives a Sell online switch
     shop_fields = next(b for b in CONTENT if b.slug == "square-shop-fields").payload["fields"]
     assert "sellOnline" in {f["key"] for f in shop_fields}
+
+
+# ── studio pickup: a second link with no shipping fee ────────────────────────
+
+
+PAYMENT_LINKS = "/v2/online-checkout/payment-links"
+CATALOG_UPSERT = ("POST", "/v2/catalog/object")
+STOCK = ("POST", "/v2/inventory/changes/batch-create")
+NEW_LINK = ("POST", PAYMENT_LINKS)
+
+
+def _pickup_fails(status, body):
+    """The listing stubs, with the pickup link answering `status` / `body` and the shipped link working."""
+    http = _listing_http()
+    http.routes.insert(0, ("POST", PAYMENT_LINKS, 0, lambda b: (status, body) if _is_pickup(b) else (200, LINK)))
+    return http
+
+
+def test_a_piece_with_a_shipping_fee_gets_both_links_pickup_first():
+    http = _listing_http()
+    out = _list(http, shipping_fee="$45")
+    assert http.paths() == [CATALOG_UPSERT, STOCK, NEW_LINK, NEW_LINK]
+    assert _is_pickup(http.calls[2]["json"]) and not _is_pickup(http.calls[3]["json"])
+    assert (out["checkout_url"], out["pickup_checkout_url"]) == ("https://square.link/u/abc", "https://square.link/u/pickup")
+    assert (out["payment_link_id"], out["pickup_payment_link_id"], out["pickup_order_id"], out["pickup_error"]) == ("PL1", "PU1", "ORDP", None)
+
+
+def test_the_pickup_link_sells_the_same_variation_at_the_same_price_with_no_shipping():
+    http = _listing_http()
+    _list(http, shipping_fee="$45")
+    (pickup,) = _link_bodies(http, pickup=True)
+    (shipped,) = _link_bodies(http, pickup=False)
+    # the same catalog variation, so either sale takes the one stock to 0 and square-mark-sold finds the item by it
+    assert pickup["order"]["line_items"] == shipped["order"]["line_items"] == [{"catalog_object_id": "VAR1", "quantity": "1"}]
+    assert pickup["order"]["location_id"] == LOCATION
+    # no shipping fee, and no shipping address (asking for one makes Square give the order a SHIPMENT fulfillment)
+    assert pickup["checkout_options"] == {"redirect_url": "https://art.example/sold/blue-hour"}
+    assert pickup["order"]["fulfillments"] == [
+        {"type": "PICKUP", "state": "PROPOSED", "pickup_details": {"schedule_type": "ASAP", "note": PICKUP_NOTE}}
+    ]
+    assert PICKUP_NOTE == "Studio pickup. We'll email you to arrange a time."
+    assert pickup["payment_note"] == "blue-hour (studio pickup)" and shipped["payment_note"] == "blue-hour"
+    assert pickup["idempotency_key"] != shipped["idempotency_key"]
+
+
+@pytest.mark.parametrize("pickup", [None, "", True, "true", "True", "yes"])
+def test_pickup_is_on_unless_switched_off(pickup):
+    http = _listing_http()
+    _list(http, shipping_fee="$45", pickup=pickup)
+    assert len(_link_bodies(http, pickup=True)) == 1
+
+
+@pytest.mark.parametrize("pickup", [False, "false", "False", "0", "no", "off"])
+def test_pickup_switched_off_makes_only_the_shipped_link(pickup):
+    http = _listing_http()
+    out = _list(http, shipping_fee="$45", pickup=pickup)
+    assert http.paths() == [CATALOG_UPSERT, STOCK, NEW_LINK]
+    assert not _link_bodies(http, pickup=True)
+    assert {k: out[k] for k in NO_PICKUP} == NO_PICKUP
+
+
+@pytest.mark.parametrize("fee", [None, "", 0, "0"])
+def test_a_piece_with_no_shipping_fee_needs_no_pickup_link(fee):
+    http = _listing_http()
+    out = _list(http, shipping_fee=fee, pickup=True)
+    assert http.paths() == [CATALOG_UPSERT, STOCK, NEW_LINK] and out["pickup_checkout_url"] is None
+
+
+def test_a_listing_from_before_pickup_gets_its_pickup_link_on_the_same_catalog_item():
+    # Listed before pickup existed: a variation and a shipped link, no pickup link.
+    http = _listing_http(upsert=UPDATED_ITEM)
+    out = _list(http, shipping_fee="$45", variation_id="VAR0", payment_link_id="OLD")
+    upserts = [c for c in http.calls if (c["method"], c["url"].split(".com", 1)[1]) == CATALOG_UPSERT]
+    assert len(upserts) == 1 and upserts[0]["json"]["object"]["id"] == "ITEM0"  # updated in place: no second catalog item
+    assert http.paths()[-3:] == [NEW_LINK, NEW_LINK, ("DELETE", f"{PAYMENT_LINKS}/OLD")]  # both new links before the old one goes
+    assert (out["item_id"], out["variation_id"], out["pickup_payment_link_id"]) == ("ITEM0", "VAR0", "PU1")
+
+
+def test_relisting_replaces_both_links_new_ones_first():
+    http = _listing_http(upsert=UPDATED_ITEM)
+    _list(http, shipping_fee="$45", variation_id="VAR0", payment_link_id="OLD", pickup_payment_link_id="OLDPU")
+    deleted = [path for method, path in http.paths() if method == "DELETE"]
+    assert deleted == [f"{PAYMENT_LINKS}/OLD", f"{PAYMENT_LINKS}/OLDPU"]
+    assert http.paths().index(("DELETE", f"{PAYMENT_LINKS}/OLD")) > max(i for i, p in enumerate(http.paths()) if p == NEW_LINK)
+
+
+def test_switching_pickup_off_deletes_the_pickup_link():
+    http = _listing_http(upsert=UPDATED_ITEM)
+    out = _list(http, shipping_fee="$45", pickup=False, variation_id="VAR0", payment_link_id="OLD", pickup_payment_link_id="OLDPU")
+    assert not _link_bodies(http, pickup=True)
+    assert [path for method, path in http.paths() if method == "DELETE"] == [f"{PAYMENT_LINKS}/OLD", f"{PAYMENT_LINKS}/OLDPU"]
+    assert out["pickup_checkout_url"] is None
+
+
+def test_a_cleared_pickup_link_id_stored_as_false_is_nothing_to_delete():
+    # The list workflow stores `false` for "no pickup link" (set_metadata skips empty values); it comes back as the id.
+    http = _listing_http(upsert=UPDATED_ITEM)
+    _list(http, shipping_fee="$45", variation_id="VAR0", payment_link_id="OLD", pickup_payment_link_id=False)
+    assert [path for method, path in http.paths() if method == "DELETE"] == [f"{PAYMENT_LINKS}/OLD"]
+
+
+def test_pickup_link_refused_by_square_still_lists_the_piece_with_shipping():
+    http = _pickup_fails(
+        400, _square_error("INVALID_REQUEST_ERROR", "MISSING_REQUIRED_PARAMETER", field="order.fulfillments[0].pickup_details.recipient")
+    )
+    out = _list(http, shipping_fee="$45", payment_link_id="OLD")
+    assert (out["payment_link_id"], out["pickup_payment_link_id"], out["pickup_checkout_url"]) == ("PL1", None, None)
+    assert "studio-pickup link" in out["pickup_error"] and "recipient" in out["pickup_error"]
+    assert ("DELETE", f"{PAYMENT_LINKS}/OLD") in http.paths()
+
+
+@pytest.mark.parametrize(("status", "code"), [(503, CODE_UNAVAILABLE), (429, CODE_RATE_LIMITED), (401, CODE_AUTH)])
+def test_pickup_link_failing_for_now_raises_before_any_new_shipped_link(status, code):
+    http = _pickup_fails(status, b"")
+    error = _list_fails_with(http, shipping_fee="$45", payment_link_id="OLD")
+    assert error.code == code and "studio-pickup link" in str(error)
+    assert not _link_bodies(http, pickup=False)  # no payable link left behind unstored
+    assert not any(c["method"] == "DELETE" for c in http.calls)  # the old link still sells it
+    assert error.partial["stock_set"] is True and "pickup_payment_link_id" not in error.partial
+
+
+def test_partial_failure_pickup_made_shipped_failed_retry_reuses_the_pickup_link():
+    failing = _failing("POST", PAYMENT_LINKS, 0, lambda b: (200, PICKUP_LINK) if _is_pickup(b) else (503, b""))
+    first = _list_fails_with(failing, shipping_fee="$45", payment_link_id="OLD")
+    assert (first.code, first.partial["pickup_payment_link_id"], first.partial["pickup_checkout_url"]) == (
+        CODE_UNAVAILABLE,
+        "PU1",
+        "https://square.link/u/pickup",
+    )
+    http = _listing_http()
+    out = _list(http, resume=first.partial, shipping_fee="$45", payment_link_id="OLD")
+    assert not _link_bodies(http, pickup=True)  # no second pickup link
+    assert http.paths() == [NEW_LINK, ("DELETE", f"{PAYMENT_LINKS}/OLD")]
+    assert (out["payment_link_id"], out["pickup_payment_link_id"]) == ("PL1", "PU1")
+
+
+def test_partial_failure_after_a_price_change_retires_the_pickup_link_the_failed_attempt_made():
+    failing = _failing("POST", PAYMENT_LINKS, 0, lambda b: (200, PICKUP_LINK) if _is_pickup(b) else (503, b""))
+    first = _list_fails_with(failing, shipping_fee="$45")
+    first.partial["variation_id"] = "VAR0"  # the stubbed catalog answers for VAR0
+    http = _listing_http(upsert=UPDATED_ITEM)
+    new_pickup = {"payment_link": {"id": "PU2", "url": "https://square.link/u/pickup2"}}
+    http.routes.insert(0, ("POST", PAYMENT_LINKS, 0, lambda b: (200, new_pickup) if _is_pickup(b) else (200, LINK)))
+    out = _list(http, resume=first.partial, shipping_fee="$45", price=900)
+    assert len(_link_bodies(http, pickup=True)) == 1  # a new one at the new price
+    assert [path for method, path in http.paths() if method == "DELETE"] == [f"{PAYMENT_LINKS}/PU1"]  # PU1 sells at the old price
+    assert (out["pickup_payment_link_id"], out["payment_link_id"]) == ("PU2", "PL1")
+
+
+def test_close_listing_closes_both_links_after_the_stock():
+    http = _listing_http()
+    out = _close(http, pickup_payment_link_id="PU1")
+    assert http.paths() == [STOCK, ("DELETE", f"{PAYMENT_LINKS}/PL1"), ("DELETE", f"{PAYMENT_LINKS}/PU1")]
+    assert out == {"closed": True, "already": False, "stock_zeroed": True, "pickup_closed": True}
+
+
+@pytest.mark.parametrize("pickup_id", [None, "", False])
+def test_close_listing_without_a_pickup_link_deletes_only_the_shipped_one(pickup_id):
+    http = _listing_http()
+    out = _close(http, pickup_payment_link_id=pickup_id)
+    assert http.paths() == [STOCK, ("DELETE", f"{PAYMENT_LINKS}/PL1")] and out["pickup_closed"] is False
+
+
+def test_close_listing_pickup_failure_keeps_progress_and_the_retry_deletes_only_it():
+    http = _listing_http()
+    http.routes.insert(0, ("DELETE", "/payment-links/PU1", 503, b""))
+    with pytest.raises(SquareError) as raised:
+        _close(http, pickup_payment_link_id="PU1")
+    assert raised.value.partial == {"for": "PL1", "stock_zeroed": True, "link_deleted": True}
+    retry = _listing_http()
+    out = _close(retry, resume=raised.value.partial, pickup_payment_link_id="PU1")
+    assert retry.paths() == [("DELETE", f"{PAYMENT_LINKS}/PU1")]
+    assert out == {"closed": True, "already": False, "stock_zeroed": True, "pickup_closed": True}
+
+
+def test_close_listing_pickup_link_already_gone_is_closed():
+    http = _listing_http()
+    http.routes.insert(0, ("DELETE", "/payment-links/PU1", 404, _square_error("INVALID_REQUEST_ERROR", "NOT_FOUND")))
+    assert _close(http, pickup_payment_link_id="PU1")["pickup_closed"] is True
+
+
+# ── studio pickup in the declared workflows ───────────────────────────────────
+
+
+def _list_steps():
+    return _workflow("square-list-for-sale")["actions"]
+
+
+def test_list_for_sale_passes_pickup_and_the_stored_pickup_link():
+    args = _list_steps()[0]["args"]
+    assert args["pickup"] == "${entry.data.pickupAvailable}"
+    assert args["pickup_payment_link_id"] == "${entry.metadata.square_pickup_payment_link_id}"
+
+
+def test_list_for_sale_stores_the_pickup_link_next_to_the_shipped_one():
+    stored = _list_steps()[1]["metadata"]
+    assert stored["pickup_checkout_url"] == "${steps.listing.output.pickup_checkout_url}"  # provider-neutral, beside checkout_url
+    assert stored["square_pickup_payment_link_id"] == "${steps.listing.output.pickup_payment_link_id}"
+    assert stored["square_listed_for"] == LISTED_FOR
+
+
+def test_list_for_sale_clears_an_old_pickup_link_when_there_is_none_now():
+    # set_metadata never writes an empty value, so "none" is written as false — or the site would keep a deleted link's button.
+    clear = _list_steps()[2]
+    assert (clear["op"], clear["metadata"]) == ("set_metadata", NO_PICKUP_LINK)
+    assert set(NO_PICKUP_LINK.values()) == {False} and "pickup_checkout_url" in NO_PICKUP_LINK
+    assert clear["when"] == [{"field": "steps.listing.output.pickup_checkout_url", "op": "exists", "value": False}]
+    assert _list_steps()[3]["task"] == "request_site_rebuild"
+
+
+def test_the_listing_marker_changes_with_price_shipping_and_pickup_and_reads_missing_pickup_as_on():
+    assert LISTED_FOR == '${entry.data.price}|${entry.data.shippingFee}|${entry.data.pickupAvailable|default:"true"|lower}'
+    condition = {"field": "entry.metadata.square_listed_for", "op": "neq", "value": LISTED_FOR}
+    assert condition in _workflow("square-list-for-sale")["conditions"]
+    # every marker stored before pickup ("price|shipping") differs from the new form, so those items list again once
+    assert LISTED_FOR.count("|${") == 2
+
+
+def test_the_shop_fields_add_an_offer_studio_pickup_switch_on_by_default():
+    fields = {f["key"]: f for f in next(b for b in CONTENT if b.slug == "square-shop-fields").payload["fields"]}
+    assert {k: fields["pickupAvailable"][k] for k in ("label", "type", "defaultValue")} == {
+        "label": "Offer studio pickup",
+        "type": "boolean",
+        "defaultValue": True,
+    }
+
+
+def test_mark_sold_needs_nothing_new_for_a_pickup_sale():
+    # Both links sell the one variation, so a pickup sale is the same inventory.count.updated for the same square_variation_id.
+    definition = _workflow("square-mark-sold")
+    assert definition["target"]["query"]["metadata"] == {"square_variation_id": "${event.payload.data.object.inventory_counts.0.catalog_object_id}"}
+
+
+# ── the README's error table is the policy the provider declares ──────────────
+
+
+def _readme_error_rows() -> dict[str, list[str]]:
+    from pathlib import Path
+
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    table = readme.split("### Errors", 1)[1].split("\n\n## ", 1)[0]
+    rows = [line.strip("|").split("|") for line in table.splitlines() if line.startswith("| `")]
+    return {cells[0].strip().strip("`"): [c.strip() for c in cells[1:]] for cells in rows if cells[0].strip() != "`code`"}
+
+
+def test_the_readme_error_table_lists_every_code():
+    assert set(_readme_error_rows()) == set(CODES)
+
+
+def test_the_readme_error_table_says_what_a_refused_pickup_link_does():
+    _when, create, _close_column = _readme_error_rows()[CODE_INVALID]
+    assert "pickup" in create.lower()
+    # and the provider does what it says: a refused pickup link is not an error of the listing
+    out = _list(_pickup_fails(400, _square_error("INVALID_REQUEST_ERROR", "INVALID_VALUE")), shipping_fee="$45")
+    assert out["pickup_error"] and out["checkout_url"]

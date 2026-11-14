@@ -12,11 +12,12 @@ The loop:
   other way — switching Sell online off, unpublishing, archiving — closes its link the same way.
 
 Sites stay provider-neutral: the workflows store the Buy-button link as `checkout_url` (with
-`checkout_provider: square`) and mark `checkout_closed` once sold — keys any commerce integration can
-write. Square's own ids stay under `square_*`.
+`checkout_provider: square`), the studio-pickup link (when the item has one) as `pickup_checkout_url`,
+and mark `checkout_closed` once sold — keys any commerce integration can write. Square's own ids stay
+under `square_*`.
 
 Closing is ordered so a Square failure can't leave the piece for sale: first `checkout_closed: true` and a
-site rebuild (the Buy button goes), then `close_listing` (stock to 0, then the link deleted), and only once
+site rebuild (the Buy buttons go), then `close_listing` (stock to 0, then both links deleted), and only once
 that succeeds `square_link_closed: true`. The close workflows run while `square_link_closed` isn't true, so
 a retry Marvin schedules for a failed close still passes their conditions after the button is gone.
 
@@ -46,11 +47,18 @@ INTEGRATION_PARAM = {
 WEBHOOK_SLUG = "square-events"
 SALES_METRIC = "square_sales"  # one observation per sold item: subject = slug, value = listed price, window = day sold
 
+# What an item was listed for: price, shipping fee and whether it offers studio pickup. The list workflow runs while the
+# stored `square_listed_for` differs, so a change to any of them lists the item again. A missing pickupAvailable (every
+# item from before the switch existed) reads as on, the same as the provider treats it; `lower` makes a stored "true" and
+# True the same text, so a save that only makes the default explicit doesn't re-list.
+LISTED_FOR = '${entry.data.price}|${entry.data.shippingFee}|${entry.data.pickupAvailable|default:"true"|lower}'
+
 SHOP_FIELDS = ContentBlueprint(
     kind="entry_fields",
     slug="square-shop-fields",
-    name="Shop fields (Sell online, price, shipping)",
-    description="Adds a Sell online switch, a price and a flat shipping fee to the item type. Fields it already has are left alone.",
+    name="Shop fields (Sell online, price, shipping, studio pickup)",
+    description="Adds a Sell online switch, a price, a flat shipping fee and an Offer studio pickup switch to the item type. "
+    "Fields it already has are left alone.",
     required=True,
     category=CATEGORY,
     parameters=(ENTRY_TYPE_PARAM,),
@@ -64,6 +72,14 @@ SHOP_FIELDS = ContentBlueprint(
                 "label": "Shipping fee",
                 "type": "text",
                 "help": "Flat shipping charge added at checkout, e.g. $45. Blank = none.",
+            },
+            {
+                "key": "pickupAvailable",
+                "label": "Offer studio pickup",
+                "type": "boolean",
+                "defaultValue": True,
+                "helpText": "A second checkout for collecting the piece from the studio: same price, no shipping fee. "
+                "Only for items with a shipping fee. Left unset counts as on.",
             },
         ],
     },
@@ -84,11 +100,14 @@ EVENTS_WEBHOOK = ContentBlueprint(
     },
 )
 
+NO_PICKUP_LINK = {"pickup_checkout_url": False, "square_pickup_payment_link_id": False, "square_pickup_order_id": False}
+
 LIST_ON_PUBLISH = ContentBlueprint(
     kind="workflow",
     slug="square-list-for-sale",
     name="Square: list for sale",
-    description="When a published item has Sell online on — or its price or shipping changes — create (or refresh) its Square listing and store the checkout link on it.",
+    description="When a published item has Sell online on — or its price, shipping or studio pickup changes — create (or refresh) its "
+    "Square listing and store its checkout links (shipped, and studio pickup) on it.",
     required=True,
     category=CATEGORY,
     parameters=(ENTRY_TYPE_PARAM, INTEGRATION_PARAM),
@@ -104,7 +123,7 @@ LIST_ON_PUBLISH = ContentBlueprint(
                 {"field": "entry.data.sellOnline", "op": "eq", "value": True},
                 {"field": "entry.data.status", "op": "neq", "value": "sold"},
                 {"field": "entry.data.price", "op": "exists"},
-                {"field": "entry.metadata.square_listed_for", "op": "neq", "value": "${entry.data.price}|${entry.data.shippingFee}"},
+                {"field": "entry.metadata.square_listed_for", "op": "neq", "value": LISTED_FOR},
             ],
             "actions": [
                 {
@@ -120,6 +139,8 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "description": "${entry.summary}",
                         "variation_id": "${entry.metadata.square_variation_id}",
                         "payment_link_id": "${entry.metadata.square_payment_link_id}",
+                        "pickup": "${entry.data.pickupAvailable}",
+                        "pickup_payment_link_id": "${entry.metadata.square_pickup_payment_link_id}",
                         "image_url": "${entry.image}",
                     },
                 },
@@ -135,9 +156,20 @@ LIST_ON_PUBLISH = ContentBlueprint(
                         "checkout_provider": "square",
                         "checkout_closed": False,
                         "square_link_closed": False,
-                        "square_listed_for": "${entry.data.price}|${entry.data.shippingFee}",
+                        "square_listed_for": LISTED_FOR,
                         "square_listed_price": "${steps.listing.output.listed_price}",
+                        "pickup_checkout_url": "${steps.listing.output.pickup_checkout_url}",
+                        "square_pickup_payment_link_id": "${steps.listing.output.pickup_payment_link_id}",
+                        "square_pickup_order_id": "${steps.listing.output.pickup_order_id}",
                     },
+                },
+                # set_metadata skips a value that resolved to nothing, so "no pickup link" (pickup switched off, no shipping fee, or
+                # Square refused it) is written as false: otherwise the old link's URL would stay and the site would show a dead button.
+                {
+                    "kind": "entry",
+                    "op": "set_metadata",
+                    "metadata": NO_PICKUP_LINK,
+                    "when": [{"field": "steps.listing.output.pickup_checkout_url", "op": "exists", "value": False}],
                 },
                 {"kind": "handler", "task": "request_site_rebuild", "config": {"reason": "square listing"}},
             ],
@@ -196,7 +228,7 @@ MARK_SOLD = ContentBlueprint(
 
 
 def _close_steps(reason: str) -> list[dict]:
-    """Hide the Buy button before touching Square, so a close that fails (and is retried) never leaves the
+    """Hide the Buy buttons (`checkout_closed` hides the studio-pickup one too) before touching Square, so a close that fails (and is retried) never leaves the
     piece for sale on the site. `square_listed_for: closed` never equals a price|shipping, so putting the
     item back on sale lists it again."""
     return [
@@ -206,7 +238,11 @@ def _close_steps(reason: str) -> list[dict]:
             "kind": "integration",
             "integration": "{{integration}}",
             "action": "close_listing",
-            "args": {"payment_link_id": "${entry.metadata.square_payment_link_id}", "variation_id": "${entry.metadata.square_variation_id}"},
+            "args": {
+                "payment_link_id": "${entry.metadata.square_payment_link_id}",
+                "pickup_payment_link_id": "${entry.metadata.square_pickup_payment_link_id}",
+                "variation_id": "${entry.metadata.square_variation_id}",
+            },
         },
         {"kind": "entry", "op": "set_metadata", "metadata": {"square_link_closed": True}},
     ]

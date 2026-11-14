@@ -1,10 +1,11 @@
 """Square provider: list a one-of-a-kind item in the catalog and sell it through a payment link.
 
-A listing is three Square objects: a catalog ITEM with one ITEM_VARIATION (inventory tracked, so
-an in-person sale on a card reader decrements the same stock), an inventory count of exactly 1 at
-the configured location, and a payment link whose order references that variation by
-``catalog_object_id``. A quick_pay link would be an ad-hoc amount with no tie to inventory, so a
-painting could sell twice.
+A listing is a catalog ITEM with one ITEM_VARIATION (inventory tracked, so an in-person sale on a
+card reader decrements the same stock), an inventory count of exactly 1 at the configured location,
+and a payment link whose order references that variation by ``catalog_object_id``. A quick_pay link
+would be an ad-hoc amount with no tie to inventory, so a painting could sell twice. A piece with a
+shipping fee can also get a second, studio-pickup link: the same variation and price, no shipping fee,
+and a PICKUP fulfillment. Both links draw on the one stock of 1, so whichever sells first takes it.
 
 The provider is pure with respect to Marvin: it gets ``config``, the resolved ``secret`` (the
 access token), a ``logger`` and a safe ``http`` client via ``ctx``, and returns dicts. Storing the
@@ -56,6 +57,12 @@ ONE_OF_A_KIND = "1"  # Square quantities are decimal strings
 NONE_LEFT = "0"
 VARIATION_NAME = "Original"
 SHIPPING_FEE_NAME = "Shipping"
+# The studio-pickup link: Square shows the note with the order in its Point of Sale and dashboard. ASAP rather than a
+# scheduled time because the studio arranges the time with the buyer by email afterwards.
+PICKUP_NOTE = "Studio pickup. We'll email you to arrange a time."
+PICKUP_PAYMENT_NOTE = "{slug} (studio pickup)"
+PICKUP_SCHEDULE = "ASAP"
+OFF_WORDS = frozenset({"false", "0", "no", "off"})
 SLUG_PLACEHOLDER = "{slug}"
 HTTP_NOT_FOUND = 404
 HTTP_SERVER_ERROR = 500
@@ -117,6 +124,11 @@ IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg", "jpg"), (b"\x89PNG\r\n\x1a\n
 _ID = {"type": "string"}
 _AMOUNT = {"type": ["number", "string"], "description": "Dollars: a number (1170) or text ('$1,170')."}
 
+# What a create_listing retry carries over from the attempt it resumes, when its input is unchanged.
+_DONE_KEYS = ("saved", "image_id", "stock_set")
+_LINK_KEYS = ("payment_link_id", "checkout_url", "order_id")
+_PICKUP_KEYS = ("pickup_done", "pickup_payment_link_id", "pickup_checkout_url", "pickup_order_id", "pickup_error")
+
 # ---- how Marvin handles each code -----------------------------------------------------------
 # Declared, never acted on here: Marvin applies the policy (review, notify, retry) to whatever workflow
 # called the action. Lookup: action[code] > provider[code] > action["*"] > provider["*"].
@@ -155,6 +167,13 @@ READ_ONLY_POLICY: ErrorPolicy = {code: Handle() for code in (*CODES, ANY_CODE)}
 
 def _now_rfc3339() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _is_on(value) -> bool:
+    """A yes/no argument where nothing (a field the item doesn't have yet) means yes."""
+    if value is None or isinstance(value, bool):
+        return value is not False
+    return str(value).strip().lower() not in OFF_WORDS
 
 
 def _fingerprint(*parts) -> str:
@@ -328,6 +347,12 @@ class SquareProvider(IntegrationProvider):
                     "description": {"type": "string"},
                     "variation_id": {**_ID, "description": "Existing variation from an earlier listing of the same item."},
                     "payment_link_id": {**_ID, "description": "Existing payment link to replace."},
+                    "pickup": {
+                        "type": ["boolean", "string", "null"],
+                        "description": "Also make a studio-pickup link (same price, no shipping fee). Left out or blank means yes; "
+                        "it is only made when there is a shipping fee to leave off.",
+                    },
+                    "pickup_payment_link_id": {**_ID, "description": "Existing studio-pickup link to replace (or delete, when pickup is off)."},
                     "image_url": {
                         **_ID,
                         "description": "Public URL of the item's picture (JPEG, PNG or GIF). Uploaded to the catalog item so the checkout shows it; "
@@ -347,6 +372,13 @@ class SquareProvider(IntegrationProvider):
                     "order_id": _ID,
                     "image_id": _ID,
                     "listed_price": {"type": "number", "description": "The price the item was listed at, in dollars (what a sale of it is worth)."},
+                    "pickup_payment_link_id": {**_ID, "description": "The studio-pickup link; null when none was made."},
+                    "pickup_checkout_url": {**_ID, "description": "The studio-pickup checkout; null when none was made."},
+                    "pickup_order_id": _ID,
+                    "pickup_error": {
+                        **_ID,
+                        "description": "Why Square refused the studio-pickup link, when it did (the listing went ahead without it).",
+                    },
                 },
             },
             error_policy=CREATE_LISTING_POLICY,
@@ -355,13 +387,14 @@ class SquareProvider(IntegrationProvider):
             key="close_listing",
             label="Close listing",
             description=(
-                "Set the item's stock to 0, then delete its checkout link (Square cancels its order). Stock goes first so a "
-                "link that can't be deleted can't sell anything; a link that is already gone counts as closed."
+                "Set the item's stock to 0, then delete its checkout link and its studio-pickup link (Square cancels their orders). "
+                "Stock goes first so a link that can't be deleted can't sell anything; a link that is already gone counts as closed."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "payment_link_id": _ID,
+                    "pickup_payment_link_id": {**_ID, "description": "The listing's studio-pickup link, deleted after the main one. Optional."},
                     "variation_id": {
                         **_ID,
                         "description": "The listing's variation, whose stock is set to 0 first. Without it only the link is deleted.",
@@ -372,7 +405,12 @@ class SquareProvider(IntegrationProvider):
             },
             output_schema={
                 "type": "object",
-                "properties": {"closed": {"type": "boolean"}, "already": {"type": "boolean"}, "stock_zeroed": {"type": "boolean"}},
+                "properties": {
+                    "closed": {"type": "boolean"},
+                    "already": {"type": "boolean"},
+                    "stock_zeroed": {"type": "boolean"},
+                    "pickup_closed": {"type": "boolean", "description": "A studio-pickup link was passed and is now gone."},
+                },
             },
             error_policy=CLOSE_LISTING_POLICY,
         ),
@@ -575,25 +613,42 @@ class SquareProvider(IntegrationProvider):
         self._ok_json(resp, f"delete payment link {payment_link_id}")
         return True
 
-    def _checkout_options(self, ctx: IntegrationContext, slug: str, shipping_cents: int) -> dict:
-        options: dict = {"ask_for_shipping_address": True}
+    def _checkout_options(self, ctx: IntegrationContext, slug: str, shipping_cents: int, *, pickup: bool = False) -> dict:
+        # Asking for a shipping address makes Square give the order a SHIPMENT fulfillment, so the pickup link doesn't.
+        options: dict = {} if pickup else {"ask_for_shipping_address": True}
         redirect = (self._cfg(ctx).get("redirect_url") or "").strip()
         if redirect:
             options["redirect_url"] = redirect.replace(SLUG_PLACEHOLDER, quote(slug, safe=""))
-        if shipping_cents > 0:
+        if shipping_cents > 0 and not pickup:
             options["shipping_fee"] = {"name": SHIPPING_FEE_NAME, "charge": {"amount": shipping_cents, "currency": self._currency(ctx)}}
         return options
 
+    @staticmethod
+    def _pickup_fulfillment() -> dict:
+        # No recipient: the buyer isn't known when the link is made. Square's checkout asks for the buyer's email and phone and adds
+        # them to the fulfillment's recipient once paid (Square's checkout guide); not verified against a real pickup order.
+        return {"type": "PICKUP", "state": "PROPOSED", "pickup_details": {"schedule_type": PICKUP_SCHEDULE, "note": PICKUP_NOTE}}
+
     def _create_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, shipping_cents: int, name: str, key: str) -> dict:
-        body = {
-            "idempotency_key": key,
-            # Referencing the catalog variation (not quick_pay) is what ties an online sale to the
-            # same inventory the card reader decrements.
-            "order": {"location_id": location_id, "line_items": [{"catalog_object_id": variation_id, "quantity": ONE_OF_A_KIND}]},
-            "checkout_options": self._checkout_options(ctx, slug, shipping_cents),
-            "payment_note": slug,
-        }
-        link = self._post(ctx, "/v2/online-checkout/payment-links", body, f'create the checkout link for "{name}"').get("payment_link") or {}
+        return self._post_link(
+            ctx, variation_id, location_id, self._checkout_options(ctx, slug, shipping_cents), slug, None, key, f'the checkout link for "{name}"'
+        )
+
+    def _create_pickup_link(self, ctx: IntegrationContext, variation_id: str, location_id: str, slug: str, name: str, key: str) -> dict:
+        options = self._checkout_options(ctx, slug, 0, pickup=True)
+        note = PICKUP_PAYMENT_NOTE.format(slug=slug)
+        return self._post_link(ctx, variation_id, location_id, options, note, self._pickup_fulfillment(), key, f'the studio-pickup link for "{name}"')
+
+    def _post_link(
+        self, ctx, variation_id: str, location_id: str, options: dict, payment_note: str, fulfillment: dict | None, key: str, what: str
+    ) -> dict:
+        # Referencing the catalog variation (not quick_pay) is what ties an online sale to the
+        # same inventory the card reader decrements.
+        order: dict = {"location_id": location_id, "line_items": [{"catalog_object_id": variation_id, "quantity": ONE_OF_A_KIND}]}
+        if fulfillment:
+            order["fulfillments"] = [fulfillment]
+        body = {"idempotency_key": key, "order": order, "checkout_options": options, "payment_note": payment_note}
+        link = self._post(ctx, "/v2/online-checkout/payment-links", body, f"create {what}").get("payment_link") or {}
         if not link.get("id") or not link.get("url"):
             raise SquareError("Square returned a payment link with no id or url.")
         return link
@@ -656,14 +711,14 @@ class SquareProvider(IntegrationProvider):
 
         The catalog item it saved is always reused, so a retry never makes a duplicate item. Its other
         steps count as done only if the listing's input is unchanged; if the price (say) changed since,
-        they are redone, and the link that attempt made is retired with the old one — it sells at the old price."""
+        they are redone, and the links that attempt made are retired with the old ones — they sell at the old price."""
         resume = ctx.resume if isinstance(ctx.resume, dict) else {}
         progress.update({k: resume[k] for k in ("item_id", "variation_id") if resume.get(k)})
         retire = [link for link in resume.get("retire_link_ids") or [] if link]
         if resume.get("for") == fingerprint:
-            progress.update({k: resume[k] for k in ("saved", "image_id", "stock_set", "payment_link_id", "checkout_url", "order_id") if k in resume})
-        elif resume.get("payment_link_id"):
-            retire.append(resume["payment_link_id"])
+            progress.update({k: resume[k] for k in (*_DONE_KEYS, *_LINK_KEYS, *_PICKUP_KEYS) if k in resume})
+        else:
+            retire += [resume[k] for k in ("payment_link_id", "pickup_payment_link_id") if resume.get(k)]
         if retire:
             progress["retire_link_ids"] = retire
         progress["for"] = fingerprint
@@ -681,10 +736,15 @@ class SquareProvider(IntegrationProvider):
             raise SquareError(f'"{name}" can\'t be listed: {e}', CODE_INVALID) from e
         description = str(args.get("description") or "").strip()
         old_variation_id = str(args.get("variation_id") or "").strip()
-        old_link_id = str(args.get("payment_link_id") or "").strip()
+        old_link_ids = [str(args.get(k) or "").strip() for k in ("payment_link_id", "pickup_payment_link_id")]
         image_url = str(args.get("image_url") or "").strip()
+        # Pickup only takes something off when there is a shipping fee; without one the main link already has no shipping.
+        offer_pickup = _is_on(args.get("pickup")) and shipping_cents > 0
         location_id = self._location_id(ctx)
-        fingerprint = _fingerprint(slug, name, description, money, image_url, location_id, self._checkout_options(ctx, slug, shipping_cents))
+        pickup_for = (self._checkout_options(ctx, slug, 0, pickup=True) | {"fulfillment": self._pickup_fulfillment()}) if offer_pickup else None
+        fingerprint = _fingerprint(
+            slug, name, description, money, image_url, location_id, self._checkout_options(ctx, slug, shipping_cents), pickup_for
+        )
         self._resume_listing(ctx, fingerprint, progress)
 
         # 1. The catalog item (and its picture, best effort). Keys repeat across one retry chain for the same
@@ -711,15 +771,19 @@ class SquareProvider(IntegrationProvider):
             self._set_stock(ctx, variation_id, location_id, ONE_OF_A_KIND, f'set the stock of "{name}" to 1')
             progress["stock_set"] = True
 
-        # 3. The new link — before the old one goes, so the item is never left without a way to buy it.
+        # 3. The new links — before the old ones go, so the item is never left without a way to buy it. The pickup link
+        # first: a Square refusal of it (its order shape is the newer, less proven one) then leaves no new link behind.
+        if offer_pickup and not progress.get("pickup_done"):
+            self._make_pickup_link(ctx, variation_id, location_id, slug, name, fingerprint, progress)
         if not progress.get("payment_link_id"):
             key = ctx.idempotency_key("link", fingerprint, variation_id)
             link = self._create_link(ctx, variation_id, location_id, slug, shipping_cents, name, key)
             progress.update(payment_link_id=link["id"], checkout_url=link["url"], order_id=link.get("order_id"))
 
-        # 4. Retire the old link, and any an earlier attempt made for different input.
-        for link_id in dict.fromkeys([old_link_id, *progress.get("retire_link_ids", [])]):
-            if link_id and link_id != progress["payment_link_id"]:
+        # 4. Retire the old links, and any an earlier attempt made for different input.
+        current = {progress["payment_link_id"], progress.get("pickup_payment_link_id")}
+        for link_id in dict.fromkeys([*old_link_ids, *progress.get("retire_link_ids", [])]):
+            if link_id and link_id not in current:
                 self._delete_link(ctx, link_id)
                 progress["retire_link_ids"] = [x for x in progress.get("retire_link_ids", []) if x != link_id]
         return {
@@ -730,17 +794,33 @@ class SquareProvider(IntegrationProvider):
             "order_id": progress.get("order_id"),
             "image_id": progress.get("image_id"),
             "listed_price": money["amount"] / CENTS_PER_UNIT,
+            **{k: progress.get(k) for k in _PICKUP_KEYS if k != "pickup_done"},
         }
+
+    def _make_pickup_link(self, ctx, variation_id: str, location_id: str, slug: str, name: str, fingerprint: str, progress: dict) -> None:
+        """The studio-pickup link. Square refusing it (`invalid`) costs the pickup option, not the listing: the item still sells
+        with shipping, and the reason is returned as `pickup_error`. Anything that may pass on a retry is raised."""
+        key = ctx.idempotency_key("pickup-link", fingerprint, variation_id)
+        try:
+            link = self._create_pickup_link(ctx, variation_id, location_id, slug, name, key)
+        except SquareError as e:
+            if e.code != CODE_INVALID:
+                raise
+            ctx.logger.warning("square: listed %s without a studio-pickup link: %s", slug, e)
+            progress.update(pickup_done=True, pickup_error=str(e))
+            return
+        progress.update(pickup_done=True, pickup_payment_link_id=link["id"], pickup_checkout_url=link["url"], pickup_order_id=link.get("order_id"))
 
     def _action_close_listing(self, args: dict, ctx: IntegrationContext, progress: dict) -> dict:
         payment_link_id = str(args.get("payment_link_id") or "").strip()
         if not payment_link_id:
             raise SquareError("close_listing needs 'payment_link_id'.", CODE_INVALID)
         variation_id = str(args.get("variation_id") or "").strip()
+        pickup_link_id = str(args.get("pickup_payment_link_id") or "").strip()
         resume = ctx.resume if isinstance(ctx.resume, dict) else {}
         progress["for"] = payment_link_id
-        if resume.get("for") == payment_link_id and resume.get("stock_zeroed"):
-            progress["stock_zeroed"] = True
+        if resume.get("for") == payment_link_id:
+            progress.update({k: resume[k] for k in ("stock_zeroed", "link_deleted") if k in resume})
 
         # Stock first: if the link then can't be deleted, it has nothing left to sell.
         if variation_id and not progress.get("stock_zeroed"):
@@ -754,5 +834,14 @@ class SquareProvider(IntegrationProvider):
         elif not variation_id:
             ctx.logger.warning("square: closing %s without a variation_id, so its stock is left as it is", payment_link_id)
 
-        deleted = self._delete_link(ctx, payment_link_id)
-        return {"closed": True, "already": not deleted, "stock_zeroed": bool(progress.get("stock_zeroed"))}
+        # Then both links. A retry after the pickup link failed only deletes that one.
+        if "link_deleted" not in progress:
+            progress["link_deleted"] = self._delete_link(ctx, payment_link_id)
+        if pickup_link_id and pickup_link_id != payment_link_id:
+            self._delete_link(ctx, pickup_link_id)
+        return {
+            "closed": True,
+            "already": not progress["link_deleted"],
+            "stock_zeroed": bool(progress.get("stock_zeroed")),
+            "pickup_closed": bool(pickup_link_id),
+        }

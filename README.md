@@ -12,6 +12,10 @@ Listing an item creates three things in Square:
 Because the link references the catalog variation rather than an ad-hoc amount, an online sale and
 an in-person sale on a Square card reader draw from the same stock of 1.
 
+An item with a shipping fee also gets a **studio-pickup link** (0.7): the same variation and price, no
+shipping fee, and an order fulfillment of type `PICKUP` with the note "Studio pickup. We'll email you to
+arrange a time." Both links sell the one piece of stock, so whichever is paid first takes it.
+
 ## Install
 
 On a Marvin host:
@@ -44,8 +48,8 @@ No changes to Marvin core or its frontend. Marvin discovers the provider through
 | **Credential** | `access_token`: Square personal access token or OAuth token |
 | **Config** | `environment` (`sandbox` \| `production`, default `sandbox`), `location_id` (required for listing), `currency` (`USD`), `redirect_url` (may contain `{slug}`) |
 | **Action** | `list_locations`: `{}` → `{ "locations": [{ "id", "name", "status" }] }` |
-| **Action** | `create_listing`: `{ "slug", "name", "price", "shipping_fee"?, "description"?, "variation_id"?, "payment_link_id"?, "image_url"? }` → `{ "item_id", "variation_id", "payment_link_id", "checkout_url", "order_id", "image_id" }` |
-| **Action** | `close_listing`: `{ "payment_link_id", "variation_id"? }` → `{ "closed": true, "already": bool, "stock_zeroed": bool }` |
+| **Action** | `create_listing`: `{ "slug", "name", "price", "shipping_fee"?, "description"?, "variation_id"?, "payment_link_id"?, "pickup"?, "pickup_payment_link_id"?, "image_url"? }` → `{ "item_id", "variation_id", "payment_link_id", "checkout_url", "order_id", "image_id", "listed_price", "pickup_payment_link_id", "pickup_checkout_url", "pickup_order_id", "pickup_error" }` |
+| **Action** | `close_listing`: `{ "payment_link_id", "pickup_payment_link_id"?, "variation_id"? }` → `{ "closed": true, "already": bool, "stock_zeroed": bool, "pickup_closed": bool }` |
 
 **Prices** take a number in dollars (`1170`, `1170.5`) or text as an editor would type it
 (`"$1,170"`). The result is converted to integer cents. Zero, negative, or ambiguous prices are
@@ -59,18 +63,31 @@ creates the new link, and only then deletes the old one (a link that is already 
 item is never left without a way to buy it. The checkout URL changes, so store the new one. If the
 stored variation no longer exists in Square, a new item is created.
 
+**Studio pickup.** `pickup` (default on: left out, blank or null all mean yes; `false`, `"false"`,
+`"0"`, `"no"`, `"off"` mean no) asks for a second link the buyer uses to collect the piece: the same
+catalog variation and price, no `shipping_fee`, no shipping address (asking for one makes Square give
+the order a `SHIPMENT` fulfillment), and a `PICKUP` fulfillment (`schedule_type: ASAP`, the note above;
+no recipient, since the buyer isn't known yet: Square's checkout asks for their email and phone). Its
+`payment_note` is `<slug> (studio pickup)`. It is made only when there is a shipping fee to leave off;
+with none, the one link already has no shipping. Re-listing replaces it like the main link; with pickup
+off (or no fee) the old one passed as `pickup_payment_link_id` is deleted and the `pickup_*` outputs
+are null. The pickup link is created **before** the main one, so if Square refuses it nothing new is
+left behind; a refusal (`invalid`) costs only the pickup option: the item is listed with shipping and
+the reason comes back as `pickup_error`. Any other failure of it fails the listing (retried as below).
+
 **Closing.** `close_listing` first sets the variation's stock to 0, then deletes the payment link
-(Square cancels the order behind it). Stock goes first so that if the link can't be deleted, it has
+and the `pickup_payment_link_id` one, if given (Square cancels the orders behind them). Stock goes first so that if the link can't be deleted, it has
 nothing left to sell. A link that is already gone returns `already: true`; a variation that is
-already gone has no stock to zero. Without a `variation_id` only the link is deleted.
+already gone has no stock to zero. Without a `variation_id` only the links are deleted.
 
 **Partial progress.** Listing is several Square calls, so a failure partway through carries the steps
 that completed on the error (`partial`: the catalog item's ids, whether the stock was set, the new
-link). Marvin hands that back as `ctx.resume` when it retries, and the retry continues where it
-stopped: it reuses the same catalog item (never a duplicate), skips what is done, and a retry that
-only has the old link left to delete does just that. If the item's price or text changed in between,
-the completed steps are redone on the same catalog item and the link the failed attempt made is
-deleted too. Closing works the same way: a retry after the stock was zeroed only deletes the link.
+link, the new pickup link). Marvin hands that back as `ctx.resume` when it retries, and the retry
+continues where it stopped: it reuses the same catalog item (never a duplicate), never makes a second
+pickup link, skips what is done, and a retry that only has the old links left to delete does just that.
+If the item's price or text changed in between, the completed steps are redone on the same catalog item
+and the links the failed attempt made are deleted too. Closing works the same way: a retry after the
+stock was zeroed only deletes the links, and one after the main link went only deletes the pickup link.
 
 **Idempotency keys** come from `ctx.idempotency_key(...)`: the same on every attempt of one retry
 chain for the same request, so a request Square already did (its answer lost to a timeout) is replayed
@@ -97,7 +114,7 @@ workspace admins, *retry* tries the step again later (re-checking the workflow's
 | `rate_limited` | `RATE_LIMITED`, HTTP 429 | Retry after 1m, 5m, 15m, 1h; then notify | Same |
 | `unavailable` | `API_ERROR`, HTTP 5xx, or Square couldn't be reached (timeout, refused connection) | Retry after 2m, 10m, 30m, 2h, 6h; then notify and review | Same |
 | `conflict` | `VERSION_MISMATCH` (the item was edited in Square meanwhile), `IDEMPOTENCY_KEY_REUSED`, HTTP 409 | Retry after 30s, 2m (it re-reads the item first); then review | Same |
-| `invalid` | `INVALID_REQUEST_ERROR`, HTTP 400/422, or a price/shipping fee that isn't an amount, or a missing slug/name/price | Review: fix the item | Review |
+| `invalid` | `INVALID_REQUEST_ERROR`, HTTP 400/422, or a price/shipping fee that isn't an amount, or a missing slug/name/price | Review: fix the item. Except the studio-pickup link: Square refusing it is not a failure; the item is listed without it and the reason returned as `pickup_error` | Review |
 | `not_found` | Square's `NOT_FOUND`: an object the item points at is gone | Review: look at the item's stored `square_*` ids | Success: already gone, so closed |
 | `unknown` | Anything else, e.g. a response missing the ids Square should return (also any code not listed) | Retry after 5m; then review and notify | Same |
 
@@ -108,8 +125,8 @@ that is already gone, is not an error (see above).
 
 ## What a workspace gets — declared, applied from the integration's card
 
-Sites never depend on Square: the Buy button reads the provider-neutral `checkout_url` /
-`checkout_closed` metadata, which any commerce integration's workflows can write.
+Sites never depend on Square: the Buy buttons read the provider-neutral `checkout_url` /
+`pickup_checkout_url` / `checkout_closed` metadata, which any commerce integration's workflows can write.
 
 Nothing is created on install. The integration's card lists what it needs; **Apply** creates only
 what is missing (Marvin's blueprint contract), and webhooks/workflows arrive **switched off**. Two
@@ -118,9 +135,9 @@ parameters: `entry_type` (the type whose entries are for sale, default `artwork`
 
 | Kind | Slug | What it does |
 |---|---|---|
-| fields | `square-shop-fields` | Adds `sellOnline` (boolean), `price` (text) and `shippingFee` (text) to the item type — fields it already has are left alone. |
+| fields | `square-shop-fields` | Adds `sellOnline` (boolean), `price` (text), `shippingFee` (text) and `pickupAvailable` (boolean "Offer studio pickup", on by default; unset counts as on) to the item type — fields it already has are left alone. |
 | incoming webhook | `square-events` | Square posts here. Signature scheme `square`, key in the workspace secret `SQUARE_SIGNATURE_KEY`. |
-| workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price/shipping that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below and the listed price → rebuild the site. Covers first listing, switching Sell online on later, and price changes. |
+| workflow | `square-list-for-sale` | Any update of a published item with Sell online on, a price, not sold, and a price / shipping / studio pickup that differs from what it was listed at (`square_listed_for`): `create_listing` → store the ids below and the listed price → rebuild the site. Covers first listing, switching Sell online on later, price changes and switching pickup on or off. |
 | workflow | `square-mark-sold` | `inventory.count.updated`, `IN_STOCK` quantity `0` → the item with that `square_variation_id`, unless its checkout is already closed → status `sold`, and the sale recorded in the `square_sales` metric. Covers a sale through the link *and* a card-reader sale rung up as the catalog item; the 0 that closing a listing sets is not a sale. |
 | workflow | `square-close-when-sold` | Item status becomes `sold` (by a sale or by hand) → close safely (below). Runs once per item. |
 | workflow | `square-close-when-withdrawn` | Sell online switched off → close safely. Switching it back on lists it again. |
@@ -138,7 +155,7 @@ or with a `metric` step (`op: read`) in a workflow of your own: `count` is sales
 
 1. mark `checkout_closed: true` (and `square_listed_for: closed`, so putting the item back on sale lists it again);
 2. request a site rebuild — the Buy button disappears whatever Square does next;
-3. `close_listing` — stock to 0, then the link deleted;
+3. `close_listing` — stock to 0, then the link deleted, then the studio-pickup link;
 4. mark `square_link_closed: true`.
 
 The workflows run while `square_link_closed` isn't true. If step 3 fails, Marvin's retry re-checks
@@ -156,8 +173,12 @@ Metadata the workflows keep on each item:
 | `square_payment_link_id` | `payment_link_id` (passed back when re-listing, and to `close_listing`) |
 | `square_order_id` | `order_id` |
 | `checkout_url` | `checkout_url` — the Buy button's link (provider-neutral key a site reads) |
+| `pickup_checkout_url` | `pickup_checkout_url` — the studio-pickup button's link (provider-neutral); `false` when the item has none |
+| `square_pickup_payment_link_id` | `pickup_payment_link_id` (passed back when re-listing, and to `close_listing`); `false` when none |
+| `square_pickup_order_id` | `pickup_order_id`; `false` when none |
+| `square_listed_for` | `price\|shippingFee\|pickup` the item was listed for (pickup unset reads `true`); `closed` or `reset` to list it again |
 | `checkout_provider` | `square` |
-| `checkout_closed` | set when the item leaves the shop, before Square is called: hides the Buy button (provider-neutral) |
+| `checkout_closed` | set when the item leaves the shop, before Square is called: hides both Buy buttons (provider-neutral) |
 | `square_link_closed` | set once Square confirms the link is closed; `false` again when the item is re-listed |
 
 ### After Apply
@@ -180,6 +201,15 @@ harmless (the link is already gone, and the stock goes to 0).
 each. Items listed before the update carry no `square_listed_price`, so a sale of one is marked sold but not
 recorded; *Re-list every item for sale on Square* (Workflow Library) stores it on every listed item.
 
+**Upgrading to 0.7 (studio pickup).** Apply on the card adds the `pickupAvailable` field (fields the type
+already has are left alone). Then click **Update** on the four close workflows **first**, so a sale through
+a pickup link closes both links, and only then on `square-list-for-sale`. The stored `square_listed_for` of
+every item listed before 0.7 is `price|shipping`, which the new `price|shipping|pickup` never equals: each one
+lists again on its next edit, or all at once with *Re-list every item for sale on Square*. That re-list keeps
+the catalog item and replaces the shipped link with a new one (a new URL; the site reads it from the entry)
+and adds the pickup link. `mark sold` needs no update: both links sell the same variation. Needs a Marvin
+with template filters (`|default`, `|lower`) and step `when` conditions.
+
 Webhook signature verification happens in Marvin core. This integration contributes the
 `square` signature scheme (base64 HMAC-SHA256 over the notification URL + body, header
 `x-square-hmacsha256-signature`) through `signature_schemes`, so it appears in every incoming
@@ -192,8 +222,9 @@ webhook's scheme picker while the integration is installed.
   error code means. Marvin's agents read it when building workflows where Square is connected, and Marvin's manual
   search finds it.
 - **A recipe** in the Workflow Library, *Re-list every item for sale on Square*: a manual run that makes every
-  published, for-sale item list itself again (a fresh catalog item, stock and checkout link) by resetting
-  `square_listed_for`, for the switch from sandbox to production or after a token or location change. It relies on
+  published, for-sale item list itself again (its catalog item refreshed, stock and new checkout links) by resetting
+  `square_listed_for`, for the switch from sandbox to production, after a token or location change, or to give items
+  listed before 0.7 their studio-pickup link. It relies on
   the *Square: list for sale* workflow being on. Shown as "From the Square plugin 0.4.0", offered once Square is
   connected.
 
